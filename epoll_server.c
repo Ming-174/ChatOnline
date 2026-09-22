@@ -6,14 +6,126 @@
 #include<netinet/in.h>
 #include<string.h>
 #include<errno.h>
+#include<fcntl.h>
+#include<stdlib.h>
+/*
+*			协议
+* 协议头：消息体的长度，通过uint32储存，用n-h转型
+* 消息体：具体的数据包
+* 消息头与消息体是一体数据包
+* 协议层应该在先读取一次协议头，再按协议头读取协议体
+* 必须在读取到消息头要求的消息体，才能进行广播，这期间消息头和消息体会被存在conn
+*/
+
+#define MAX_EVENTS 128
+#define MAX_CLIENTS 1024
+int epfd = -1;
+
+//结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
 	int fd;
-	char int_buf[1024];
-	int in_len;
-	char out_buf[1024];
-	int out_len;
+	//接收缓冲区
+	char rcbuf[1024];
+	//接收缓冲区的数据字节长度
+	int rclen;
+	//发送缓冲区
+	char sdbuf[1024];
+	//发送缓冲区的长度
+	int sdlen;
 }Conn;
-#define MAX_CLIENTS 128
+Conn conns[1024];
+//非阻塞IO设置
+void set_nonblock(int fd) {
+	int flag = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+}
+//清理模块，解耦设计
+void clean(Conn* conn) {
+	//先除名，再关闭，防止fd被复用但又被除名
+	epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
+	int fd = conn->fd;
+	conn->fd = -1;
+	conn->rclen = 0;
+	conn->sdlen = 0;
+	close(fd);
+	printf("Client:%d is disconnect\n");
+}
+//缓冲区完整读取模块
+int recv_clear(Conn* conn) {
+	while (1) {
+		int n = recv(conn->fd, conn->rcbuf + conn->rclen, 1023 - conn->rclen, 0);
+		if (n < 0) {
+			if (errno == EAGAIN) {
+				//正常退出出口
+				return conn->rclen;
+			}
+			//坏了
+			else return -1;
+		}
+		//客户端关闭
+		else if (n == 0)return 0;
+		//正常读取到数据
+		else if (n > 0)conn->rclen += n;
+	}
+}
+//现在留有一个问题，我在想遇到问题的时候，是当场解决问题，还是返回上级调用交还
+//就比如这个clean，我是应该handler解决，还是recv的时候就解决
+
+//消息消费
+void msg_cpy(Conn* conn,int mes_len) {
+	int len = 4 + mes_len;
+	for (int i = 0; i < MAX_CLIENTS) {
+		//确认不是空位，且不是发消息来的客户端
+		if (conns[i].fd != -1 && conns[i].fd != conn->fd) {
+			//谨记不是每个数组都是空的，可能有旧数据存留
+			memcpy(conns[i].sdbuf+conns[i].sdlen, conn->rcbuf, len);
+			conns[i].sdlen += len;
+		}
+		int remain = conn->rclen - len;
+		memmove(conn->rcbuf, conn->rcbuf + len, remain);
+	}
+}
+
+void broadcast() {
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		if (conns[i].fd != -1) {
+			int n = send(conns[i].fd, conns[i].sdbuf, conns[i].sdlen, 0);
+			memmove(conns[i].sdbuf, conns[i].sdbuf + n, conns[i].sdlen - n);
+			conns[i].sdlen -= n;
+		}
+	}
+}
+
+//啥都干模块
+void handler(Conn* conn) {
+	int n = recv_clear(Conn * conn);
+	if (n == -1 ) {		//连接失败，直接下一个
+		perror("recv");
+		clean(conn);
+	}
+	
+	else if (n == 0) {		//连接关闭
+		clean(conn);
+	}
+	else if (n < 4&&n>0) {		//半个头
+		//进入不完整情况处理，待完善
+	}
+	else if (n >= 4) {		//头完整，再进入消息体判断
+		uint32_t net_len;
+		//将rcbuf里取出头4个字节放进net_len
+		memcpy(&net_len, conn->rcbuf, 4);
+		uint32_t len = ntohl(net_len);
+		//判断消息体长度是否为消息头要求的长度
+		if (conn->rclen >= len + 4) {
+			msg_cpy(conn, len);
+			broadcast();
+		}
+		else if (conn->rclen < len + 4) {
+			//不完整情况处理，待完善
+		}
+	}
+}
+
 int main() {
 	//创建服务器文件描述符，IPV4,TCP协议
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -43,25 +155,46 @@ int main() {
 	epoll_ctl = (epfd, EPOLL_CTL_ADD, server_fd, &ev);
 	//创建事件列表
 	struct epoll_event events[MAX_EVENTS];
-	Conn conn[1024];
+	//连接名单
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		conns[i].fd = -1;
+	}
+
 	while (1) {
-		int n = epoll_wait(epfd, MAX_CLIENTS, -1);
+		int n = epoll_wait(epfd, MAX_EVENTS, -1);
+		if (n < 0) {
+			if (errno == EINTR)continue;
+			perror("epoll_wait");
+			continue;
+		}
 		for (int i = 0; i < n; i++) {
 			int fd = events[i].data.fd;
 			//有新连接
 			if (fd == server_fd) {
 				int client_fd = accept(server_fd, NULL, NULL);
 				if (client_fd < 0) {
-					if (errno == EINR)continue;
-					close(client_fd);
-					perror("accept")continue;
+					close(fd);
+					perror("accept");
+					continue;
 				}
+				//放入epoll
+				struct epoll_event cli;
+				cli.data.fd = client_fd;
+				cli.event = EPOLLIN;
+				epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
+				//放入名单，初始化，清除可能的旧数据
+				conns[client_fd].fd = client_fd;
+				conns[client_fd].rclen = 0;
+				conns[client_fd].sdlen = 0;
+				//设置非阻塞IO
+				set_nonblock(client_fd);
+				//新连接就绪
+				printf("Client:%d connected\n", client_fd);
 			}
-			struct epoll_event cli;
-			cli.data.fd = client_fd;
-			cli.event = EPOLLIN;
-			epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
-			conn[i].fd = client_fd;
+			else {
+				//拿到数据，一次性获取缓冲区全部的数据，协议解析判断，尝试发送，可能再次发送
+
+			}
 		}
 	}
 }
