@@ -97,6 +97,41 @@ void msg_cpy(Conn* c1, Conn* c2, int len) {
 	//可以留一个日志打印fprint/write
 	//存在问题：conn2缓冲区sdbuf不足处理
 }
+
+//发送：两种情况，内核缓冲区满send终止&&sdbuf完全发送
+int send_clear(Conn* conn) {
+	if (conn->fd == -1)return 0;
+	if (conn->sdlen == 0)return 0;
+	int sent = 0;
+	while (conn->sdlen > sent) {
+		int n = send(conn->fd, conn->sdbuf+sent, conn->sdlen-sent, MSG_NOSIGNAL);
+		if (n <= 0) {
+			if (errno == EAGAIN) {
+				conn->sdlen -= sent;
+				//发送后不仅要调整sdlen指针，还要消除数据
+				memmove(conn->sdbuf, conn->sdbuf + sent, conn->sdlen);
+				return sent;
+			}
+			//系统打断应该继续尝试
+			else if (errno == EINTR) {
+				continue;
+			}
+			else {
+				//其他情况，包括n==0，在send里并不代表客户端关闭，是真的error
+				//此处并不应该clean，应该交给上级
+				conn->sdlen -= sent;
+				memmove(conn->sdbuf, conn->sdbuf + sent, conn->sdlen);
+				return -1;
+			}
+		}
+
+		sent += n;
+	}
+	//这里无须调整sdbuf，指针自0开始，新数据会覆盖旧数据
+	conn->sdlen -= sent;
+	return sent;
+}
+
 //广播
 void broadcast(Conn* conn,int len) {
 	//将conn的消息拷贝到各个客户端的缓冲区上
