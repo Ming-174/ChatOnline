@@ -9,7 +9,6 @@
 #include<fcntl.h>
 #include<stdlib.h>
 /*
-*			协议
 * 协议头：消息体的长度，通过uint32储存，用n-h转型
 * 消息体：具体的数据包
 * 消息头与消息体是一体数据包
@@ -33,6 +32,7 @@ typedef struct Conn {
 	//发送缓冲区的长度
 	int sdlen;
 }Conn;
+
 Conn conns[1024];
 //非阻塞IO设置
 void set_nonblock(int fd) {
@@ -48,7 +48,7 @@ void clean(Conn* conn) {
 	conn->rclen = 0;
 	conn->sdlen = 0;
 	close(fd);
-	printf("Client:%d is disconnect\n");
+	printf("Client:%d is disconnect\n", fd);
 }
 //缓冲区完整读取模块
 int recv_clear(Conn* conn) {
@@ -71,34 +71,48 @@ int recv_clear(Conn* conn) {
 //现在留有一个问题，我在想遇到问题的时候，是当场解决问题，还是返回上级调用交还
 //就比如这个clean，我是应该handler解决，还是recv的时候就解决
 
-//消息消费
-void msg_cpy(Conn* conn,int mes_len) {
-	int len = 4 + mes_len;
-	for (int i = 0; i < MAX_CLIENTS) {
-		//确认不是空位，且不是发消息来的客户端
-		if (conns[i].fd != -1 && conns[i].fd != conn->fd) {
-			//谨记不是每个数组都是空的，可能有旧数据存留
-			memcpy(conns[i].sdbuf+conns[i].sdlen, conn->rcbuf, len);
-			conns[i].sdlen += len;
-		}
-		int remain = conn->rclen - len;
-		memmove(conn->rcbuf, conn->rcbuf + len, remain);
-	}
+
+//void msg_cpy(Conn* conn,int mes_len) {
+//	int len = 4 + mes_len;
+//	for (int i = 0; i < MAX_CLIENTS; i++) {
+//		//确认不是空位，且不是发消息来的客户端
+//		if (conns[i].fd != -1 && conns[i].fd != conn->fd) {
+//			//谨记不是每个数组都是空的，可能有旧数据存留
+//			memcpy(conns[i].sdbuf+conns[i].sdlen, conn->rcbuf, len);
+//			conns[i].sdlen += len;
+//		}
+//	}
+//	int remain = conn->rclen - len;
+//	memmove(conn->rcbuf, conn->rcbuf + len, remain);
+//	conn->rclen -= len;
+//}
+
+//消息消费,将c1缓冲区内的一条数据完整的搬进c2，并进行指针偏移
+void msg_cpy(Conn* c1, Conn* c2, int len) {
+	//谨记不是每个数组都是空的，可能有旧数据存留
+	memcpy(c2->sdbuf + c2->sdlen, c1->rcbuf, len);
+	c2->sdlen += len;
+
+	//可以留一个日志打印fprint/write
+	//存在问题：conn2缓冲区sdbuf不足处理
 }
 
-void broadcast() {
+void broadcast(Conn* conn,int len) {
 	for (int i = 0; i < MAX_CLIENTS; i++) {
-		if (conns[i].fd != -1) {
+		if (conns[i].fd != -1&&conns[i].fd!=conn->fd) {
+			msg_cpy(conn, &conns[i], len);
 			int n = send(conns[i].fd, conns[i].sdbuf, conns[i].sdlen, 0);
 			memmove(conns[i].sdbuf, conns[i].sdbuf + n, conns[i].sdlen - n);
 			conns[i].sdlen -= n;
 		}
 	}
+	memmove(conn->rcbuf, conn->rcbuf + len, conn->rclen - len);
+	conn->rclen -= len;
 }
 
 //啥都干模块
 void handler(Conn* conn) {
-	int n = recv_clear(Conn * conn);
+	int n = recv_clear(conn);
 	if (n == -1 ) {		//连接失败，直接下一个
 		perror("recv");
 		clean(conn);
@@ -117,8 +131,7 @@ void handler(Conn* conn) {
 		uint32_t len = ntohl(net_len);
 		//判断消息体长度是否为消息头要求的长度
 		if (conn->rclen >= len + 4) {
-			msg_cpy(conn, len);
-			broadcast();
+			broadcast(conn,len+4);
 		}
 		else if (conn->rclen < len + 4) {
 			//不完整情况处理，待完善
@@ -147,12 +160,12 @@ int main() {
 	}
 
 	//epoll TL建立
-	int epfd = epoll_create(0);
+	epfd = epoll_create(0);
 	//初始化一个epoll实例，用来将服务器接听口放进epoll
 	struct epoll_event ev;
 	ev.data.fd = server_fd;
 	ev.event = EPOLLIN;
-	epoll_ctl = (epfd, EPOLL_CTL_ADD, server_fd, &ev);
+	epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
 	//创建事件列表
 	struct epoll_event events[MAX_EVENTS];
 	//连接名单
@@ -161,7 +174,7 @@ int main() {
 	}
 
 	while (1) {
-		int n = epoll_wait(epfd, MAX_EVENTS, -1);
+		int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
 		if (n < 0) {
 			if (errno == EINTR)continue;
 			perror("epoll_wait");
@@ -173,7 +186,7 @@ int main() {
 			if (fd == server_fd) {
 				int client_fd = accept(server_fd, NULL, NULL);
 				if (client_fd < 0) {
-					close(fd);
+					close(cline_fd);
 					perror("accept");
 					continue;
 				}
