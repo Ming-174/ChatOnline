@@ -8,6 +8,7 @@
 #include<errno.h>
 #include<fcntl.h>
 #include<stdlib.h>
+#include<signal.h>
 /*
 * 协议头：消息体的长度，通过uint32储存，用n-h转型
 * 消息体：具体的数据包
@@ -96,16 +97,32 @@ void msg_cpy(Conn* c1, Conn* c2, int len) {
 	//可以留一个日志打印fprint/write
 	//存在问题：conn2缓冲区sdbuf不足处理
 }
-
+//广播
 void broadcast(Conn* conn,int len) {
+	//将conn的消息拷贝到各个客户端的缓冲区上
 	for (int i = 0; i < MAX_CLIENTS; i++) {
-		if (conns[i].fd != -1&&conns[i].fd!=conn->fd) {
+		if (conns[i].fd != -1&&conns[i].fd!=conn->fd) {	
+			//如果send的用户态缓冲区不足，那就拜拜了
+			if (1024 - conns[i].sdlen < len) {
+				clean(&conns[i]);
+				continue;
+			}
+			//按照长度拷贝之后，进行传输
 			msg_cpy(conn, &conns[i], len);
-			int n = send(conns[i].fd, conns[i].sdbuf, conns[i].sdlen, 0);
+
+			int n = send(conns[i].fd, conns[i].sdbuf, conns[i].sdlen, MSG_NOSIGNAL);
+			if (n < 0) {
+				//如果EAGAIN就代表内存缓冲区满了，如果是EINTR就是被系统打断,就以后再来吧
+				if (errno == EAGAIN || errno == EINTR)continue;
+				printf("send error on fd:%d error:%s\n", conns[i].fd, strerror(errno));
+				clean(&conns[i]);
+				continue;
+			}
 			memmove(conns[i].sdbuf, conns[i].sdbuf + n, conns[i].sdlen - n);
 			conns[i].sdlen -= n;
 		}
 	}
+	//广播完毕，原消息缓冲区清理
 	memmove(conn->rcbuf, conn->rcbuf + len, conn->rclen - len);
 	conn->rclen -= len;
 }
@@ -116,10 +133,12 @@ void handler(Conn* conn) {
 	if (n == -1 ) {		//连接失败，直接下一个
 		perror("recv");
 		clean(conn);
+		break;
 	}
 	
 	else if (n == 0) {		//连接关闭
 		clean(conn);
+		break;
 	}
 	else if (n < 4&&n>0) {		//半个头
 		//进入不完整情况处理，待完善
@@ -140,6 +159,8 @@ void handler(Conn* conn) {
 }
 
 int main() {
+	//遇到信号EPIPE就忽略
+	signal(SIGPIPE, SIG_IGN);
 	//创建服务器文件描述符，IPV4,TCP协议
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	//创建IP,IPV4，端口8888（转网络短型），监视所有网口
@@ -206,7 +227,6 @@ int main() {
 			}
 			else {
 				//拿到数据，一次性获取缓冲区全部的数据，协议解析判断，尝试发送，可能再次发送
-
 			}
 		}
 	}
