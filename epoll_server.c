@@ -19,7 +19,7 @@
 
 #define MAX_EVENTS 128
 #define MAX_CLIENTS 1024
-int epfd = -1;
+int epfd;
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
@@ -40,7 +40,7 @@ void set_nonblock(int fd) {
 	int flag = fcntl(fd, F_GETFL, 0);
 	fcntl(fd, F_SETFL, flag | O_NONBLOCK);
 }
-//清理模块，解耦设计
+//清理
 void clean(Conn* conn) {
 	//先除名，再关闭，防止fd被复用但又被除名
 	epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
@@ -53,11 +53,17 @@ void clean(Conn* conn) {
 }
 //缓冲区完整读取模块
 int recv_clear(Conn* conn) {
+	int got = 0;
 	while (1) {
-		int n = recv(conn->fd, conn->rcbuf + conn->rclen, 1023 - conn->rclen, 0);
+		int n = recv(conn->fd, conn->rcbuf + got+conn->rclen, 1024-conn->rclen-got, 0);
 		if (n < 0) {
 			if (errno == EAGAIN) {
 				//正常退出出口
+				if (got == 0) {
+					if (conn->rclen == 0)return -2;
+					return conn->rclen;
+				}
+				conn->rclen += got;
 				return conn->rclen;
 			}
 			//坏了
@@ -66,27 +72,9 @@ int recv_clear(Conn* conn) {
 		//客户端关闭
 		else if (n == 0)return 0;
 		//正常读取到数据
-		else if (n > 0)conn->rclen += n;
+		else if (n > 0)got += n;
 	}
 }
-//现在留有一个问题，我在想遇到问题的时候，是当场解决问题，还是返回上级调用交还
-//就比如这个clean，我是应该handler解决，还是recv的时候就解决
-
-
-//void msg_cpy(Conn* conn,int mes_len) {
-//	int len = 4 + mes_len;
-//	for (int i = 0; i < MAX_CLIENTS; i++) {
-//		//确认不是空位，且不是发消息来的客户端
-//		if (conns[i].fd != -1 && conns[i].fd != conn->fd) {
-//			//谨记不是每个数组都是空的，可能有旧数据存留
-//			memcpy(conns[i].sdbuf+conns[i].sdlen, conn->rcbuf, len);
-//			conns[i].sdlen += len;
-//		}
-//	}
-//	int remain = conn->rclen - len;
-//	memmove(conn->rcbuf, conn->rcbuf + len, remain);
-//	conn->rclen -= len;
-//}
 
 //消息消费,将c1缓冲区内的一条数据完整的搬进c2，并进行指针偏移
 void msg_cpy(Conn* c1, Conn* c2, int len) {
@@ -100,6 +88,7 @@ void msg_cpy(Conn* c1, Conn* c2, int len) {
 
 //发送：两种情况，内核缓冲区满send终止&&sdbuf完全发送
 int send_clear(Conn* conn) {
+	//fd==-1其实应该由上一层判断，这里为防御性设计
 	if (conn->fd == -1)return 0;
 	if (conn->sdlen == 0)return 0;
 	int sent = 0;
@@ -131,8 +120,35 @@ int send_clear(Conn* conn) {
 	conn->sdlen -= sent;
 	return sent;
 }
+//当broadcast的时候调用，用来尝试发送数据，如果发送不完，而唯一发不完的正常情况就是内核发送缓冲区满了
+//当main调用的时候，就是复核，这时候的发送的内核缓冲区可用，再次尝试发送
+void flush(Conn* conn) {
+	if (conn->fd == -1)return;
+	int sd = send_clear(conn);
+	if (sd < 0) {
+		perror("send");
+		clean(conn);
+		return;
+	}
+	if (sd == 0) {
+		struct epoll_event ev;
+		ev.data.fd = conn->fd;
+		ev.events = EPOLLIN;
+	}
+	struct epoll_event ev;
+	ev.data.fd = conn->fd;
+	if (conn->sdlen > 0) {
+		ev.events = EPOLLIN | EPOLLOUT;
+	}
+	else {
+		ev.events = EPOLLIN;
+	}
+	epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
+}
 
 //广播
+//将conn拷贝到每个可用连接的sdbuf上，再让他们进行发送
+//发送完成后，清理原conn的rcbuf进行排空
 void broadcast(Conn* conn,int len) {
 	//将conn的消息拷贝到各个客户端的缓冲区上
 	for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -145,50 +161,55 @@ void broadcast(Conn* conn,int len) {
 			//按照长度拷贝之后，进行传输
 			msg_cpy(conn, &conns[i], len);
 
-			int n = send(conns[i].fd, conns[i].sdbuf, conns[i].sdlen, MSG_NOSIGNAL);
-			if (n < 0) {
-				//如果EAGAIN就代表内存缓冲区满了，如果是EINTR就是被系统打断,就以后再来吧
-				if (errno == EAGAIN || errno == EINTR)continue;
-				printf("send error on fd:%d error:%s\n", conns[i].fd, strerror(errno));
-				clean(&conns[i]);
-				continue;
-			}
-			memmove(conns[i].sdbuf, conns[i].sdbuf + n, conns[i].sdlen - n);
-			conns[i].sdlen -= n;
+			flush(&conns[i]);
 		}
 	}
 	//广播完毕，原消息缓冲区清理
+	printf("%d:%.*s\n", conn->fd, len - 4, conn->rcbuf + 4);
 	memmove(conn->rcbuf, conn->rcbuf + len, conn->rclen - len);
 	conn->rclen -= len;
 }
 
-//啥都干模块
+//协议解析
+//recv和send板块只负责尽可能从缓冲区拿出和放入数据，而拿出数据是不是一条数据包，发送的是不是一条数据包他们不处理
+//协议解析层负责：
+//判断rcbuf是否有一个完整的数据包，有的话就把他拿出来，放给各个客户端，要求他们发送
+
 void handler(Conn* conn) {
-	int n = recv_clear(conn);
-	if (n == -1 ) {		//连接失败，直接下一个
-		perror("recv");
-		clean(conn);
-		break;
-	}
-	
-	else if (n == 0) {		//连接关闭
-		clean(conn);
-		break;
-	}
-	else if (n < 4&&n>0) {		//半个头
-		//进入不完整情况处理，待完善
-	}
-	else if (n >= 4) {		//头完整，再进入消息体判断
-		uint32_t net_len;
-		//将rcbuf里取出头4个字节放进net_len
-		memcpy(&net_len, conn->rcbuf, 4);
-		uint32_t len = ntohl(net_len);
-		//判断消息体长度是否为消息头要求的长度
-		if (conn->rclen >= len + 4) {
-			broadcast(conn,len+4);
+	while(1){
+		int n = recv_clear(conn);
+		if (n == -1) {		//连接失败，直接下一个
+			perror("recv");
+			clean(conn);
+			break;
 		}
-		else if (conn->rclen < len + 4) {
-			//不完整情况处理，待完善
+
+		else if (n == 0) {		//连接关闭
+			clean(conn);
+			break;
+		}
+		else if (n == -2) {
+			//没有数据可读
+			break;
+		}
+		else if (n < 4 && n>0) {		//半个头
+			//进入不完整情况处理
+			break;
+
+		}
+		else if (n >= 4) {		//头完整，再进入消息体判断
+			uint32_t net_len;
+			//将rcbuf里取出头4个字节放进net_len
+			memcpy(&net_len, conn->rcbuf, 4);
+			uint32_t len = ntohl(net_len);
+			//判断消息体长度是否为消息头要求的长度
+			if (conn->rclen >= len + 4) {
+				broadcast(conn, len + 4);
+			}
+			else if (conn->rclen < len + 4) {
+				//不完整情况处理
+				break;
+			}
 		}
 	}
 }
@@ -216,11 +237,11 @@ int main() {
 	}
 
 	//epoll TL建立
-	epfd = epoll_create(0);
+	epfd = epoll_create(1);
 	//初始化一个epoll实例，用来将服务器接听口放进epoll
 	struct epoll_event ev;
 	ev.data.fd = server_fd;
-	ev.event = EPOLLIN;
+	ev.events = EPOLLIN;
 	epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
 	//创建事件列表
 	struct epoll_event events[MAX_EVENTS];
@@ -228,7 +249,7 @@ int main() {
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		conns[i].fd = -1;
 	}
-
+	printf("Server Online\n");
 	while (1) {
 		int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
 		if (n < 0) {
@@ -242,14 +263,14 @@ int main() {
 			if (fd == server_fd) {
 				int client_fd = accept(server_fd, NULL, NULL);
 				if (client_fd < 0) {
-					close(cline_fd);
+					close(client_fd);
 					perror("accept");
 					continue;
 				}
 				//放入epoll
 				struct epoll_event cli;
 				cli.data.fd = client_fd;
-				cli.event = EPOLLIN;
+				cli.events = EPOLLIN;
 				epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
 				//放入名单，初始化，清除可能的旧数据
 				conns[client_fd].fd = client_fd;
@@ -261,8 +282,17 @@ int main() {
 				printf("Client:%d connected\n", client_fd);
 			}
 			else {
-				//拿到数据，一次性获取缓冲区全部的数据，协议解析判断，尝试发送，可能再次发送
+				if (events[i].events & EPOLLIN) {
+					handler(&conns[fd]);
+				}
+				if (events[i].events & EPOLLOUT) {
+					flush(&conns[fd]);
+				}
 			}
 		}
 	}
+	//暂未设定如何关闭服务器
+	printf("Server offline\n");
+	close(server_fd);
+	return 0;
 }
