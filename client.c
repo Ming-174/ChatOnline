@@ -12,31 +12,60 @@ typedef struct pack {
 	int rclen;
 }Pack;
 
-//接收的时候是整个完整数据包带协议头一起接收
-int read_exact(int fd, char* buf, ssize_t size) {
-	int ret = 0;
-	while (ret < size) {
-		int n = recv(fd, buf + ret, size - ret, 0);
-		if (n == 0)return 0;
-		else if (n < 0)return -1;
-		else if (n > 0) {
-			ret += n;
-		}
-	}
-	return ret;
-}
 //清空接收的内核缓冲区
 int recv_package(Pack*pack) {
-
+	int got = 0;
+	while (1) {
+		int n = recv(pack->fd, pack->rcbuf + pack->rclen, 1024 - pack->rclen, 0);
+		if (n == 0) {
+			return 0;
+		}
+		if (n < 0) {
+			if (errno == EAGAIN) {
+				return got;
+			}
+			else return -1;
+		}
+		else {
+			got += n;
+			pack->rclen += n;
+		}
+	}
 }
 
 //数据包解析
 void* handler(void* argc) {
-	Pack pack;
-	pack.fd = (int)(intptr)argc;
-	pack.rclen = 0;
-
-
+	Pack*pack = (Pack*)argc;
+	while(1){
+		int n = recv_package(pack);
+		if (n == 0) {
+			printf("Server disconnect\n");
+			break;
+		}
+		else if (n < 0) {
+			perror("recv");
+			break;
+		}
+		if (pack->rclen > 0) {
+			if (pack->rclen < 4)continue;
+			else if (pack->rclen >= 4) {
+				uint32_t len;
+				memcpy(&len, pack->rcbuf, 4);
+				len = ntohl(len);
+				if (len + 4 <= pack->rclen) {
+					char buf[1020];
+					memcpy(buf, pack->rcbuf+4, len);
+					buf[len] = '\0';
+					printf("%s\n", buf);
+					memmove(pack->rcbuf, pack->rcbuf + len + 4, pack->rclen - len - 4);
+					pack->rclen -= len + 4;
+				}
+				else {
+					continue;
+				}
+			}
+		}
+	}
 }
 
 int write_exact(int fd, char* buf, ssize_t size) {
@@ -55,6 +84,7 @@ int write_exact(int fd, char* buf, ssize_t size) {
 	}
 	return sent;
 }
+
 //发送的时候是分段发送的
 void send_package(int fd, char* buf) {
 	uint32_t len = htonl(strlen(buf));
@@ -88,11 +118,17 @@ int main() {
 		perror("connect");
 		return 1;
 	}
+	int flag = fcntl(client_fd, F_GETFL, 0);
+	fcntl(client_fd, F_SETFL, flga | O_NOBLOCK);
+	Pack pack;
+	pack.fd = client_fd;
+	pack.rclen = 0;
+
 	pthread_t tid;
 	pthread_create(tid);
 	while (1) {
-		char buf[1023];
-		scanf("%.1023s", buf);
+		char buf[1019];
+		scanf("%.1019s", buf);
 		send_package(buf);
 	}
 }
