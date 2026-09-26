@@ -26,16 +26,16 @@ int epfd;
 typedef struct Conn {
 	int fd;
 	//接收缓冲区
-	char rcbuf[1024];
+	char rcbuf[MAX_LEN];
 	//接收缓冲区的数据字节长度
 	int rclen;
 	//发送缓冲区
-	char sdbuf[1024];
+	char sdbuf[MAX_LEN];
 	//发送缓冲区的长度
 	int sdlen;
 }Conn;
 
-Conn conns[1024];
+Conn conns[MAX_CLIENTS];
 //非阻塞IO设置
 void set_nonblock(int fd) {
 	int flag = fcntl(fd, F_GETFL, 0);
@@ -43,6 +43,10 @@ void set_nonblock(int fd) {
 }
 //清理
 void clean(Conn* conn) {
+	if (conn->fd == -1) {
+		printf("Can't not close fd:-1\n");
+		return;
+	}
 	//先除名，再关闭，防止fd被复用但又被除名
 	epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
 	int fd = conn->fd;
@@ -53,48 +57,62 @@ void clean(Conn* conn) {
 	printf("Client:%d is disconnect\n", fd);
 }
 //返回值为-1的情况代表错误和客户端关闭，这两种都需要进行clean，所以被归为一类
-//正常情况返回值为rclen的长度
+//正常情况返回值为got
+//recv_clear只负责一件事，就是尽可能把rcbuf写满，至于内核缓冲区是否排空，无所谓，内核缓冲区有残留的话下次epoll_wait会再次触发
 int recv_clear(Conn* conn) {
+	int got = 0;
 	while (1) {
 		int space = MAX_LEN - conn->rclen;
+		//写满了，就到这吧
 		if (space == 0) {
-			return conn->rclen;
+			return got;
 		}
 		int n = recv(conn->fd, conn->rcbuf + conn->rclen, space, 0);
 		if (n == 0)return -1;
 		else if (n < 0) {
+			//内核缓冲区排空
 			if (errno == EAGAIN ) {
-				return conn->rclen;
+				//正常情况下到这里是缓冲区发完了，返回前面已经发送的数据量
+				//但是有可能一开始内核缓冲区就是空的，这里got为0
+				return got;
 			}
 			else if (errno == EINTR) {
+				//系统打断，重试
 				continue;
 			}
 			else {
+				//错误处理
 				perror("recv");
 				return -1;
 			}
 		}
 		else if (n > 0) {
 			conn->rclen += n;
+			got += n;
 		}
 	}
 }
 
 //消息消费,将c1缓冲区内的一条数据完整的搬进c2，并进行指针偏移
 void msg_cpy(Conn* c1, Conn* c2, int len) {
+	//如果连接的用户态缓冲区不足，就直接放弃这个包
+	//不可以说能塞多少塞多少，这会导致没塞下的包被丢失后，客户端协议永远没办法解析完整这个包，实际上导致解析错乱，把别的数据包的消息头拿去解析了
+	if (MAX_LEN - c2->sdlen < len)return;
+
 	//谨记不是每个数组都是空的，可能有旧数据存留
 	memcpy(c2->sdbuf + c2->sdlen, c1->rcbuf, len);
 	c2->sdlen += len;
 
 	//可以留一个日志打印fprint/write
 	//存在问题：conn2缓冲区sdbuf不足处理
+	//问题已解决
 }
 
-//发送：两种情况，内核缓冲区满send终止&&sdbuf完全发送
+//发送：三种结果，内核缓冲区满send终止，sdbuf完全发送，或者两种同时发生
 //三种返回值代表三种情况
 //1.返回0，代表可发送的数据为0
 //2.返回>0，代表有数据正常发送，但不一定是将sdbuf里所有东西都发送了，不代表发送了一个完整的数据包
-//2.1这种情况要么就是发送缓冲区已满，要么就是sdbuf被清空了
+//  这种情况要么就是发送缓冲区已满，要么就是sdbuf被清空了
 //3.返回-1，代表出错
 int send_clear(Conn* conn) {
 	//fd==-1其实应该由上一层判断，这里为防御性设计
@@ -104,7 +122,9 @@ int send_clear(Conn* conn) {
 	while (conn->sdlen > sent) {
 		int n = send(conn->fd, conn->sdbuf+sent, conn->sdlen-sent, MSG_NOSIGNAL);
 		if (n <= 0) {
-			if (errno == EAGAIN) {
+			//内核缓冲区满了，已经尽力发送
+			//内核缓冲区在可能第一次调用send之前就满了，导致send_clear直接触发EAGAIN直接返回为0的sent
+			if (errno == EAGAIN||errno==EWOULDBLOCK) {
 				conn->sdlen -= sent;
 				//发送后不仅要调整sdlen指针，还要消除数据
 				memmove(conn->sdbuf, conn->sdbuf + sent, conn->sdlen);
@@ -125,6 +145,7 @@ int send_clear(Conn* conn) {
 
 		sent += n;
 	}
+	//触发conn->sdlen == sent，即所有的数据都被发出，此时内核缓冲区可能没满（循环直接结束了，没再次调用send就不知道什么情况）
 	//这里无须调整sdbuf，指针自0开始，新数据会覆盖旧数据
 	conn->sdlen -= sent;
 	return sent;
@@ -134,18 +155,24 @@ int send_clear(Conn* conn) {
 void flush(Conn* conn) {
 	if (conn->fd == -1)return;
 	int sd = send_clear(conn);
-	if (sd <= 0) {
+	if (sd < 0) {
 		perror("send");
 		clean(conn);
 		return;
 	}
 	struct epoll_event ev;
 	ev.data.fd = conn->fd;
-	if (conn->sdlen > 0) {
-		ev.events = EPOLLIN | EPOLLOUT;
-	}
-	else {
+
+	//不能直接sd==0判断，sd只代表发送了多少数据，发送了0个数据并不代表没数据可发送
+	//也可能代表内核缓冲区在第一次调用send之前就满了，导致send_clear直接触发EAGAIN直接返回0
+	if (conn->sdlen == 0) {
+		//缓冲区为空，恢复可接收状态，避免LT模式下epoll_wait一直返回该连接可用
 		ev.events = EPOLLIN;
+	}
+	else if(conn->sdlen>0){
+
+		//sdbuf用户态缓冲区还有数据没办法发出去，就注册可发送状态
+		ev.events = EPOLLIN | EPOLLOUT;
 	}
 	epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
 }
@@ -157,12 +184,8 @@ void broadcast(Conn* conn,int len) {
 	//将conn的消息拷贝到各个客户端的缓冲区上
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		if (conns[i].fd != -1&&conns[i].fd!=conn->fd) {	
-			//如果send的用户态缓冲区不足，那就拜拜了
-			if (1024 - conns[i].sdlen < len) {
-				clean(&conns[i]);
-				continue;
-			}
-			//按照长度拷贝之后，进行传输
+
+			//按照长度拷贝之后，进行传输,可能拷贝失败(sdbuf空间不足，静默丢包)
 			msg_cpy(conn, &conns[i], len);
 
 			flush(&conns[i]);
@@ -179,22 +202,21 @@ void broadcast(Conn* conn,int len) {
 //协议解析层负责：
 //判断rcbuf是否有一个完整的数据包，有的话就把他拿出来，放给各个客户端，要求他们发送
 
+//handler负责切开数据，分成一个一个的数据包，再交给broadcast
 void handler(Conn* conn) {
 	int n = recv_clear(conn);
 	if (n == -1) {		//连接失败或关闭
 		clean(conn);
 		return;
 	}
-	//else if (conn->rclen < 4 && conn->rclen>0) {		//半个头
-	//	return;
-	//}
 	while(conn->rclen >= 4) {		//头完整，再进入消息体判断
 		uint32_t net_len;
 
 		//将rcbuf里取出头4个字节放进net_len
 		memcpy(&net_len, conn->rcbuf, 4);
 		uint32_t len = ntohl(net_len);
-
+		
+		//非法大包，直接关闭违规客户端
 		if (len > MAX_LEN - 4) {
 			printf("Invalid package!\n");
 			clean(conn);
@@ -296,3 +318,7 @@ int main() {
 	close(server_fd);
 	return 0;
 }
+// 问题留存
+//1.recv_clear时，当rcbuf缓冲区满了，可能返回为0的got，但一般情况下rcbuf满了got不会为0，待研究
+//2.用户名单conn使用文件描述符做索引有危险性，当客户过多，文件描述符超过MAX_CLIENTS时会产生越界
+//3.broadcast高度绑定handler，而且broadcast控制数据包来源内存功能耦合度高
