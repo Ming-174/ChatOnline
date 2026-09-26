@@ -19,6 +19,7 @@
 
 #define MAX_EVENTS 128
 #define MAX_CLIENTS 1024
+#define MAX_LEN 1024
 int epfd;
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
@@ -51,28 +52,31 @@ void clean(Conn* conn) {
 	close(fd);
 	printf("Client:%d is disconnect\n", fd);
 }
-//缓冲区完整读取模块
+//返回值为-1的情况代表错误和客户端关闭，这两种都需要进行clean，所以被归为一类
+//正常情况返回值为rclen的长度
 int recv_clear(Conn* conn) {
-	int got = 0;
 	while (1) {
-		int n = recv(conn->fd, conn->rcbuf + got+conn->rclen, 1024-conn->rclen-got, 0);
-		if (n < 0) {
-			if (errno == EAGAIN) {
-				//正常退出出口
-				if (got == 0) {
-					if (conn->rclen == 0)return -2;
-					return conn->rclen;
-				}
-				conn->rclen += got;
+		int space = MAX_LEN - conn->rclen;
+		if (space == 0) {
+			return conn->rclen;
+		}
+		int n = recv(conn->fd, conn->rcbuf + conn->rclen, space, 0);
+		if (n == 0)return -1;
+		else if (n < 0) {
+			if (errno == EAGAIN ) {
 				return conn->rclen;
 			}
-			//坏了
-			else return -1;
+			else if (errno == EINTR) {
+				continue;
+			}
+			else {
+				perror("recv");
+				return -1;
+			}
 		}
-		//客户端关闭
-		else if (n == 0)return 0;
-		//正常读取到数据
-		else if (n > 0)got += n;
+		else if (n > 0) {
+			conn->rclen += n;
+		}
 	}
 }
 
@@ -87,6 +91,11 @@ void msg_cpy(Conn* c1, Conn* c2, int len) {
 }
 
 //发送：两种情况，内核缓冲区满send终止&&sdbuf完全发送
+//三种返回值代表三种情况
+//1.返回0，代表可发送的数据为0
+//2.返回>0，代表有数据正常发送，但不一定是将sdbuf里所有东西都发送了，不代表发送了一个完整的数据包
+//2.1这种情况要么就是发送缓冲区已满，要么就是sdbuf被清空了
+//3.返回-1，代表出错
 int send_clear(Conn* conn) {
 	//fd==-1其实应该由上一层判断，这里为防御性设计
 	if (conn->fd == -1)return 0;
@@ -125,15 +134,10 @@ int send_clear(Conn* conn) {
 void flush(Conn* conn) {
 	if (conn->fd == -1)return;
 	int sd = send_clear(conn);
-	if (sd < 0) {
+	if (sd <= 0) {
 		perror("send");
 		clean(conn);
 		return;
-	}
-	if (sd == 0) {
-		struct epoll_event ev;
-		ev.data.fd = conn->fd;
-		ev.events = EPOLLIN;
 	}
 	struct epoll_event ev;
 	ev.data.fd = conn->fd;
@@ -176,40 +180,35 @@ void broadcast(Conn* conn,int len) {
 //判断rcbuf是否有一个完整的数据包，有的话就把他拿出来，放给各个客户端，要求他们发送
 
 void handler(Conn* conn) {
-	while(1){
-		int n = recv_clear(conn);
-		if (n == -1) {		//连接失败，直接下一个
-			perror("recv");
+	int n = recv_clear(conn);
+	if (n == -1) {		//连接失败或关闭
+		clean(conn);
+		return;
+	}
+	//else if (conn->rclen < 4 && conn->rclen>0) {		//半个头
+	//	return;
+	//}
+	while(conn->rclen >= 4) {		//头完整，再进入消息体判断
+		uint32_t net_len;
+
+		//将rcbuf里取出头4个字节放进net_len
+		memcpy(&net_len, conn->rcbuf, 4);
+		uint32_t len = ntohl(net_len);
+
+		if (len > MAX_LEN - 4) {
+			printf("Invalid package!\n");
 			clean(conn);
 			break;
 		}
 
-		else if (n == 0) {		//连接关闭
-			clean(conn);
-			break;
+		//判断消息体长度是否为消息头要求的长度
+		if (conn->rclen >= len + 4) {
+			broadcast(conn, len + 4);
 		}
-		else if (n == -2) {
-			//没有数据可读
-			break;
-		}
-		else if (n < 4 && n>0) {		//半个头
-			//进入不完整情况处理
-			break;
 
-		}
-		else if (n >= 4) {		//头完整，再进入消息体判断
-			uint32_t net_len;
-			//将rcbuf里取出头4个字节放进net_len
-			memcpy(&net_len, conn->rcbuf, 4);
-			uint32_t len = ntohl(net_len);
-			//判断消息体长度是否为消息头要求的长度
-			if (conn->rclen >= len + 4) {
-				broadcast(conn, len + 4);
-			}
-			else if (conn->rclen < len + 4) {
-				//不完整情况处理
-				break;
-			}
+		else if (conn->rclen < len + 4) {
+		//非完整数据包
+		break;
 		}
 	}
 }
@@ -245,9 +244,11 @@ int main() {
 	epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
 	//创建事件列表
 	struct epoll_event events[MAX_EVENTS];
-	//连接名单
+	//连接名单，初始化
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		conns[i].fd = -1;
+		conns[i].sdlen = 0;
+		conns[i].rclen = 0;
 	}
 	printf("Server Online\n");
 	while (1) {
@@ -263,7 +264,6 @@ int main() {
 			if (fd == server_fd) {
 				int client_fd = accept(server_fd, NULL, NULL);
 				if (client_fd < 0) {
-					close(client_fd);
 					perror("accept");
 					continue;
 				}
