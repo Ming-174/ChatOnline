@@ -181,20 +181,12 @@ void flush(Conn* conn) {
 //将conn拷贝到每个可用连接的sdbuf上，再让他们进行发送
 //发送完成后，清理原conn的rcbuf进行排空
 void broadcast(Conn* conn,int len) {
-	//将conn的消息拷贝到各个客户端的缓冲区上
+
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		if (conns[i].fd != -1&&conns[i].fd!=conn->fd) {	
-
-			//按照长度拷贝之后，进行传输,可能拷贝失败(sdbuf空间不足，静默丢包)
-			msg_cpy(conn, &conns[i], len);
-
 			flush(&conns[i]);
 		}
 	}
-	//广播完毕，原消息缓冲区清理
-	printf("%d:%.*s\n", conn->fd, len - 4, conn->rcbuf + 4);
-	memmove(conn->rcbuf, conn->rcbuf + len, conn->rclen - len);
-	conn->rclen -= len;
 }
 
 //协议解析
@@ -225,7 +217,19 @@ void handler(Conn* conn) {
 
 		//判断消息体长度是否为消息头要求的长度
 		if (conn->rclen >= len + 4) {
+			for (int i = 0; i < MAX_CLIENTS; i++) {
+				
+				//将conn的消息拷贝到各个客户端的缓冲区上
+				//按照长度拷贝之后，进行传输,可能拷贝失败(sdbuf空间不足，静默丢包)
+				if(i!=conn->fd&&conns[i].fd!=-1)msg_cpy(conn, &conns[i], len + 4);
+
+			}
+			//群遍历flush一遍
 			broadcast(conn, len + 4);
+			//广播完毕，原消息缓冲区清理
+			printf("%d:%.*s\n", conn->fd, len , conn->rcbuf + 4);
+			memmove(conn->rcbuf, conn->rcbuf + len+4, conn->rclen - len-4);
+			conn->rclen -= len+4;
 		}
 
 		else if (conn->rclen < len + 4) {
