@@ -37,6 +37,20 @@ typedef struct Conn {
 
 Conn conns[MAX_CLIENTS];
 //非阻塞IO设置
+
+//先在整个conns名单遍历一遍，找到空位后将这个连接初始化，再放入，这个放入的位置idx几乎是随机，只是按顺序找空位，他所处的位置不再代表任何含义
+Conn* conn_insert(int fd) {
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		if (conns[i].fd == -1) {
+			conns[i].fd = fd;
+			conns[i].rclen = 0;
+			conns[i].sdlen = 0;
+			return &conns[i];
+		}
+	}
+	return NULL;
+}
+
 void set_nonblock(int fd) {
 	int flag = fcntl(fd, F_GETFL, 0);
 	fcntl(fd, F_SETFL, flag | O_NONBLOCK);
@@ -68,10 +82,19 @@ int recv_clear(Conn* conn) {
 			return got;
 		}
 		int n = recv(conn->fd, conn->rcbuf + conn->rclen, space, 0);
-		if (n == 0)return -1;
+		if (n == 0) { 
+			//当客户端发完消息并直接关闭时，客户端发送的FIN可能会紧跟在上一条消息的后面
+			//而我们在while循环读取，读取完最后一条消息时got能正常获取消息，
+			//但在收到FIN后TCP状态就已经变成EOF
+			//下一轮循环会读取到n==0，直接触发return -1，关闭连接，而最后一条消息还没消费
+			//在这里加一层判断，如果还有消息没处理，socket的EOF状态我们读取到了但暂不处理，虽然我们前面recv了n==0，但关闭是一种状态，不会因为前面读取了n==0，状态就消失
+			//而这个EOF状态会继续触发epoll_wait，在下一轮epoll被我们收到，这依赖LT模式
+			if (got > 0)return got;
+			return -1; 
+		}
 		else if (n < 0) {
 			//内核缓冲区排空
-			if (errno == EAGAIN ) {
+			if (errno == EAGAIN||errno == EWOULDBLOCK ) {
 				//正常情况下到这里是缓冲区发完了，返回前面已经发送的数据量
 				//但是有可能一开始内核缓冲区就是空的，这里got为0
 				return got;
@@ -161,7 +184,7 @@ void flush(Conn* conn) {
 		return;
 	}
 	struct epoll_event ev;
-	ev.data.fd = conn->fd;
+	ev.data.ptr = conn;
 
 	//不能直接sd==0判断，sd只代表发送了多少数据，发送了0个数据并不代表没数据可发送
 	//也可能代表内核缓冲区在第一次调用send之前就满了，导致send_clear直接触发EAGAIN直接返回0
@@ -178,12 +201,10 @@ void flush(Conn* conn) {
 }
 
 //广播
-//将conn拷贝到每个可用连接的sdbuf上，再让他们进行发送
-//发送完成后，清理原conn的rcbuf进行排空
-void broadcast(Conn* conn,int len) {
-
+//遍历整个conns列表，如果不是空的，也不是消息发送者本人，就进行发送，用flush能更好的发送（使用send清理sdbuf，还可以进行状态注册）
+void broadcast(Conn* conn) {
 	for (int i = 0; i < MAX_CLIENTS; i++) {
-		if (conns[i].fd != -1&&conns[i].fd!=conn->fd) {	
+		if (conns[i].fd != -1 && &conns[i] != conn) {
 			flush(&conns[i]);
 		}
 	}
@@ -192,7 +213,9 @@ void broadcast(Conn* conn,int len) {
 //协议解析
 //recv和send板块只负责尽可能从缓冲区拿出和放入数据，而拿出数据是不是一条数据包，发送的是不是一条数据包他们不处理
 //协议解析层负责：
-//判断rcbuf是否有一个完整的数据包，有的话就把他拿出来，放给各个客户端，要求他们发送
+//判断rcbuf是否有一个完整的数据包，有的话就拷贝给各个链接的sdbuf缓冲区
+//能拷贝得下就拷贝，拷贝不下就丢包
+//拷贝完就刷新sdbuf缓冲区
 
 //handler负责切开数据，分成一个一个的数据包，再交给broadcast
 void handler(Conn* conn) {
@@ -221,15 +244,16 @@ void handler(Conn* conn) {
 				
 				//将conn的消息拷贝到各个客户端的缓冲区上
 				//按照长度拷贝之后，进行传输,可能拷贝失败(sdbuf空间不足，静默丢包)
-				if(i!=conn->fd&&conns[i].fd!=-1)msg_cpy(conn, &conns[i], len + 4);
-
+				if (&conns[i] != conn && conns[i].fd != -1)msg_cpy(conn, &conns[i], len + 4);
 			}
+
 			//群遍历flush一遍
-			broadcast(conn, len + 4);
+			broadcast(conn);
+
 			//广播完毕，原消息缓冲区清理
 			printf("%d:%.*s\n", conn->fd, len , conn->rcbuf + 4);
-			memmove(conn->rcbuf, conn->rcbuf + len+4, conn->rclen - len-4);
-			conn->rclen -= len+4;
+			memmove(conn->rcbuf, conn->rcbuf + len + 4, conn->rclen - len - 4);
+			conn->rclen -= len + 4;
 		}
 
 		else if (conn->rclen < len + 4) {
@@ -242,6 +266,7 @@ void handler(Conn* conn) {
 int main() {
 	//遇到信号EPIPE就忽略
 	signal(SIGPIPE, SIG_IGN);
+
 	//创建服务器文件描述符，IPV4,TCP协议
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	//创建IP,IPV4，端口8888（转网络短型），监视所有网口
@@ -261,21 +286,38 @@ int main() {
 		return 1;
 	}
 
-	//epoll TL建立
-	epfd = epoll_create(1);
-	//初始化一个epoll实例，用来将服务器接听口放进epoll
-	struct epoll_event ev;
-	ev.data.fd = server_fd;
-	ev.events = EPOLLIN;
-	epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
-	//创建事件列表
-	struct epoll_event events[MAX_EVENTS];
 	//连接名单，初始化
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		conns[i].fd = -1;
 		conns[i].sdlen = 0;
 		conns[i].rclen = 0;
 	}
+
+	//设置服务器接听链接非阻塞，可以一口气接听多个连线
+	set_nonblock(server_fd);
+
+	//创建一个独立的服务器链接
+	Conn server_conn;
+	server_conn.fd = server_fd;
+	server_conn.rclen = 0;
+	server_conn.sdlen = 0;
+
+	//epoll TL建立
+	epfd = epoll_create(1);
+
+	//初始化一个epoll实例，用来将服务器接听口放进epoll
+	struct epoll_event ev;
+
+	//原先的实例event.data.fd改成event.data.ptr，将conn直接放入ptr，将conn整个数据结构作为实例的成员
+	ev.data.ptr = &server_conn;
+	ev.events = EPOLLIN;
+
+	//将这个服务器实例放入epoll，当server_fd触发这个实例里要求的事件EPOLLIN的时候，将server_fd对应的实例ev放入events名单里
+	epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
+
+	//创建事件列表
+	struct epoll_event events[MAX_EVENTS];
+ 
 	printf("Server Online\n");
 	while (1) {
 		int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
@@ -285,34 +327,56 @@ int main() {
 			continue;
 		}
 		for (int i = 0; i < n; i++) {
-			int fd = events[i].data.fd;
+			Conn* conn = events[i].data.ptr;
 			//有新连接
-			if (fd == server_fd) {
-				int client_fd = accept(server_fd, NULL, NULL);
-				if (client_fd < 0) {
-					perror("accept");
-					continue;
+			if (conn == &server_conn) {
+				while(1){
+					int client_fd = accept(conn->fd, NULL, NULL);
+					if (client_fd < 0) {
+						//没有新连接
+						if (errno == EAGAIN || errno == EWOULDBLOCK) {
+							break;
+						}
+						//被系统打断就重试
+						if (errno == EINTR) {
+							continue;
+						}
+						perror("accept");
+						break;
+					}
+
+					//创建新链接，初始化链接，并将新链接放入conns
+					Conn* new_conn = conn_insert(client_fd);
+					//如果连接的客户端满了，直接放弃剩下想要连接的客户端
+					if (new_conn == NULL) {
+						printf("Connection is full\n");
+						close(client_fd);
+						break;
+					}
+
+					//设置非阻塞IO
+					set_nonblock(client_fd);
+
+					//放入epoll
+					struct epoll_event cli;
+					cli.data.ptr = new_conn;
+					cli.events = EPOLLIN;
+					epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
+
+					//新连接就绪
+					printf("Client:%d connected\n", client_fd);
 				}
-				//放入epoll
-				struct epoll_event cli;
-				cli.data.fd = client_fd;
-				cli.events = EPOLLIN;
-				epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
-				//放入名单，初始化，清除可能的旧数据
-				conns[client_fd].fd = client_fd;
-				conns[client_fd].rclen = 0;
-				conns[client_fd].sdlen = 0;
-				//设置非阻塞IO
-				set_nonblock(client_fd);
-				//新连接就绪
-				printf("Client:%d connected\n", client_fd);
 			}
 			else {
+				
 				if (events[i].events & EPOLLIN) {
-					handler(&conns[fd]);
+					if (conn->fd == -1)continue;
+					handler(conn);
 				}
+				
 				if (events[i].events & EPOLLOUT) {
-					flush(&conns[fd]);
+					if (conn->fd == -1)continue;
+					flush(conn);
 				}
 			}
 		}
@@ -323,6 +387,8 @@ int main() {
 	return 0;
 }
 // 问题留存
-//1.recv_clear时，当rcbuf缓冲区满了，可能返回为0的got，但一般情况下rcbuf满了got不会为0，待研究
-//2.用户名单conn使用文件描述符做索引有危险性，当客户过多，文件描述符超过MAX_CLIENTS时会产生越界
-//3.broadcast高度绑定handler，而且broadcast控制数据包来源内存功能耦合度高
+//
+
+//refactor:重构epoll实例，原先的conn名单直接使用fd作为下标索引，这是没有逻辑的，只是数据结构上的符合
+//先在整个conns名单遍历一遍，找到空位后将这个连接初始化，再放入，这个放入的位置idx几乎是随机，只是按顺序找空位，他所处的位置不再代表任何含义
+//原先的实例event.data.fd改成event.data.ptr，将conn直接放入ptr，将conn整个数据结构作为实例的成员
