@@ -95,13 +95,13 @@ int main() {
 	//if (s < 0) {
 	//	perror("Disconnect");
 	//	return 1;
-//	}
+	//	}
 
 	pthread_t tid;
 	pthread_create(&tid, NULL, &handler, (void*)(intptr_t)client_fd);
 	pthread_detach(tid);
 	while (1) {
-		char Tell[1024];
+		char Tell[1020];
 		fgets(Tell, sizeof(Tell), stdin);
 		Tell[strcspn(Tell, "\n")] = '\0';
 		int s = send_package(client_fd, Tell);

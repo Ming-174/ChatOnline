@@ -1,0 +1,5 @@
+.idea/
+*.o
+server
+__pycache__/
+*.pyc

@@ -9,6 +9,7 @@
 #include<fcntl.h>
 #include<stdlib.h>
 #include<signal.h>
+#include<stdint.h>
 /*
 * 协议头：消息体的长度，通过uint32储存，用n-h转型
 * 消息体：具体的数据包
@@ -17,20 +18,24 @@
 * 必须在读取到消息头要求的消息体，才能进行广播，这期间消息头和消息体会被存在conn
 */
 
-#define MAX_EVENTS 128
-#define MAX_CLIENTS 1024
-#define MAX_LEN 1024
+#define MAX_EVENTS 128	//最大同时处理响应链接数
+#define MAX_CLIENTS 1024	//最大客户端链接数
+#define MAX_PACKET 1024		//单个数据包最大大小
+#define RCBUF_SIZE (2 * MAX_PACKET + 4 )	//接收缓冲区长度
+#define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
+
+#define MAX_LEN 1024	
 int epfd;
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
 	int fd;
 	//接收缓冲区
-	char rcbuf[MAX_LEN];
+	char rcbuf[RCBUF_SIZE];
 	//接收缓冲区的数据字节长度
 	int rclen;
 	//发送缓冲区
-	char sdbuf[MAX_LEN];
+	char sdbuf[SDBUF_SIZE];
 	//发送缓冲区的长度
 	int sdlen;
 }Conn;
@@ -58,7 +63,7 @@ void set_nonblock(int fd) {
 //清理
 void clean(Conn* conn) {
 	if (conn->fd == -1) {
-		printf("Can't not close fd:-1\n");
+		printf("Can't close fd:-1\n");
 		return;
 	}
 	//先除名，再关闭，防止fd被复用但又被除名
@@ -76,7 +81,7 @@ void clean(Conn* conn) {
 int recv_clear(Conn* conn) {
 	int got = 0;
 	while (1) {
-		int space = MAX_LEN - conn->rclen;
+		int space = RCBUF_SIZE - conn->rclen;
 		//写满了，就到这吧
 		if (space == 0) {
 			return got;
@@ -118,17 +123,13 @@ int recv_clear(Conn* conn) {
 
 //消息消费,将c1缓冲区内的一条数据完整的搬进c2，并进行指针偏移
 void msg_cpy(Conn* c1, Conn* c2, int len) {
-	//如果连接的用户态缓冲区不足，就直接放弃这个包
+	//如果连接的用户态缓冲区不足，就直接放弃这个包,执行静默丢包
 	//不可以说能塞多少塞多少，这会导致没塞下的包被丢失后，客户端协议永远没办法解析完整这个包，实际上导致解析错乱，把别的数据包的消息头拿去解析了
-	if (MAX_LEN - c2->sdlen < len)return;
+	if (SDBUF_SIZE - c2->sdlen < len)return;
 
 	//谨记不是每个数组都是空的，可能有旧数据存留
 	memcpy(c2->sdbuf + c2->sdlen, c1->rcbuf, len);
 	c2->sdlen += len;
-
-	//可以留一个日志打印fprint/write
-	//存在问题：conn2缓冲区sdbuf不足处理
-	//问题已解决
 }
 
 //发送：三种结果，内核缓冲区满send终止，sdbuf完全发送，或者两种同时发生
@@ -144,7 +145,7 @@ int send_clear(Conn* conn) {
 	int sent = 0;
 	while (conn->sdlen > sent) {
 		int n = send(conn->fd, conn->sdbuf+sent, conn->sdlen-sent, MSG_NOSIGNAL);
-		if (n <= 0) {
+		if (n < 0) {
 			//内核缓冲区满了，已经尽力发送
 			//内核缓冲区在可能第一次调用send之前就满了，导致send_clear直接触发EAGAIN直接返回为0的sent
 			if (errno == EAGAIN||errno==EWOULDBLOCK) {
@@ -158,12 +159,16 @@ int send_clear(Conn* conn) {
 				continue;
 			}
 			else {
-				//其他情况，包括n==0，在send里并不代表客户端关闭，是真的error
+				//其他情况
 				//此处并不应该clean，应该交给上级
 				conn->sdlen -= sent;
 				memmove(conn->sdbuf, conn->sdbuf + sent, conn->sdlen);
 				return -1;
 			}
+		}
+		//在send里并不代表客户端关闭
+		else if (n == 0) {
+			return -1;
 		}
 
 		sent += n;
@@ -199,12 +204,12 @@ void flush(Conn* conn) {
 	}
 	epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
 }
-
 //广播
 //遍历整个conns列表，如果不是空的，也不是消息发送者本人，就进行发送，用flush能更好的发送（使用send清理sdbuf，还可以进行状态注册）
-void broadcast(Conn* conn) {
+void broadcast(Conn* conn, int len) {
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		if (conns[i].fd != -1 && &conns[i] != conn) {
+			msg_cpy(conn, &conns[i], len);
 			flush(&conns[i]);
 		}
 	}
@@ -230,9 +235,9 @@ void handler(Conn* conn) {
 		//将rcbuf里取出头4个字节放进net_len
 		memcpy(&net_len, conn->rcbuf, 4);
 		uint32_t len = ntohl(net_len);
-		
+
 		//非法大包，直接关闭违规客户端
-		if (len > MAX_LEN - 4) {
+		if (len > MAX_PACKET - 4) {
 			printf("Invalid package!\n");
 			clean(conn);
 			break;
@@ -240,15 +245,9 @@ void handler(Conn* conn) {
 
 		//判断消息体长度是否为消息头要求的长度
 		if (conn->rclen >= len + 4) {
-			for (int i = 0; i < MAX_CLIENTS; i++) {
-				
-				//将conn的消息拷贝到各个客户端的缓冲区上
-				//按照长度拷贝之后，进行传输,可能拷贝失败(sdbuf空间不足，静默丢包)
-				if (&conns[i] != conn && conns[i].fd != -1)msg_cpy(conn, &conns[i], len + 4);
-			}
 
-			//群遍历flush一遍
-			broadcast(conn);
+			//广播，将信息挨个拷贝进缓冲区，再flush刷新缓冲区
+			broadcast(conn, len + 4);
 
 			//广播完毕，原消息缓冲区清理
 			printf("%d:%.*s\n", conn->fd, len , conn->rcbuf + 4);
@@ -275,6 +274,13 @@ int main() {
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(8888);
 	addr.sin_addr.s_addr = INADDR_ANY;
+
+	//启用快速重启
+	int opt = 1;
+	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+		perror("setsockopt");
+	}
+
 	//绑定IP与服务器接口
 	if ((bind(server_fd, (struct sockaddr*)&addr, sizeof(addr))) < 0) {
 		perror("bind");
@@ -386,9 +392,11 @@ int main() {
 	close(server_fd);
 	return 0;
 }
-// 问题留存
-//
 
-//refactor:重构epoll实例，原先的conn名单直接使用fd作为下标索引，这是没有逻辑的，只是数据结构上的符合
-//先在整个conns名单遍历一遍，找到空位后将这个连接初始化，再放入，这个放入的位置idx几乎是随机，只是按顺序找空位，他所处的位置不再代表任何含义
-//原先的实例event.data.fd改成event.data.ptr，将conn直接放入ptr，将conn整个数据结构作为实例的成员
+//计划
+//增加EPOLLERR / EPOLLHUP / EPOLLRDHUP处理功能
+//增加半包链接的心跳程序
+//安排压力测试
+//优化sdbuf成双指针
+//调整broadcast
+//增加日志
