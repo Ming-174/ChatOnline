@@ -73,7 +73,7 @@ void clean(Conn* conn) {
 	conn->rclen = 0;
 	conn->sdlen = 0;
 	close(fd);
-	printf("Client:%d is disconnect\n", fd);
+	printf("Client:%d disconnect\n", fd);
 }
 //返回值为-1的情况代表错误和客户端关闭，这两种都需要进行clean，所以被归为一类
 //正常情况返回值为got
@@ -195,12 +195,12 @@ void flush(Conn* conn) {
 	//也可能代表内核缓冲区在第一次调用send之前就满了，导致send_clear直接触发EAGAIN直接返回0
 	if (conn->sdlen == 0) {
 		//缓冲区为空，恢复可接收状态，避免LT模式下epoll_wait一直返回该连接可用
-		ev.events = EPOLLIN;
+		ev.events = EPOLLIN | EPOLLRDHUP;
 	}
 	else if(conn->sdlen>0){
 
 		//sdbuf用户态缓冲区还有数据没办法发出去，就注册可发送状态
-		ev.events = EPOLLIN | EPOLLOUT;
+		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
 	}
 	epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
 }
@@ -245,12 +245,14 @@ void handler(Conn* conn) {
 
 		//判断消息体长度是否为消息头要求的长度
 		if (conn->rclen >= len + 4) {
+			//防止空包
+			if (len > 0) {
+				//广播，将信息挨个拷贝进缓冲区，再flush刷新缓冲区
+				broadcast(conn, len + 4);
 
-			//广播，将信息挨个拷贝进缓冲区，再flush刷新缓冲区
-			broadcast(conn, len + 4);
-
-			//广播完毕，原消息缓冲区清理
-			printf("%d:%.*s\n", conn->fd, len , conn->rcbuf + 4);
+				//广播完毕，原消息缓冲区清理
+				printf("%d:%.*s\n", conn->fd, len, conn->rcbuf + 4);
+			}
 			memmove(conn->rcbuf, conn->rcbuf + len + 4, conn->rclen - len - 4);
 			conn->rclen -= len + 4;
 		}
@@ -366,7 +368,7 @@ int main() {
 					//放入epoll
 					struct epoll_event cli;
 					cli.data.ptr = new_conn;
-					cli.events = EPOLLIN;
+					cli.events = (EPOLLIN | EPOLLRDHUP);
 					epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
 
 					//新连接就绪
@@ -374,15 +376,27 @@ int main() {
 				}
 			}
 			else {
-				
-				if (events[i].events & EPOLLIN) {
-					if (conn->fd == -1)continue;
-					handler(conn);
+				int e = events[i].events;
+				if (conn->fd == -1)continue;
+				//对端异常关闭
+				if (e & (EPOLLERR | EPOLLHUP)) {
+					//获取异常socket属性
+					int err = 0;
+					socklen_t elen = sizeof(err);
+					getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+
+					printf("Client %d %s\n", conn->fd, err ? strerror(err) : "hang up");
+					clean(conn);
 				}
-				
-				if (events[i].events & EPOLLOUT) {
-					if (conn->fd == -1)continue;
-					flush(conn);
+				//客户端发送消息
+				if (e & EPOLLIN && conn->fd!=-1)handler(conn);
+				//向客户端发送消息
+				if (e & EPOLLOUT && conn->fd != -1)flush(conn);
+				//客户端正常挂断（未触发EPOLLIN特殊情况兜底）
+				//必须要添加非EPOLLIN情况判断，客户端发送Fin后系统会立刻上报EPOLLIN|EPOLLRDHUP
+				//如果内核缓冲区的数据还没被读取完，而我们直接通过EPOLLRDHUP关闭链接，会导致内核缓冲区的数据丢失
+				if (e & EPOLLRDHUP && conn->fd != -1 && !(e & EPOLLIN )) {
+					clean(conn);
 				}
 			}
 		}
@@ -394,7 +408,6 @@ int main() {
 }
 
 //计划
-//增加EPOLLERR / EPOLLHUP / EPOLLRDHUP处理功能
 //增加半包链接的心跳程序
 //安排压力测试
 //优化sdbuf成双指针
