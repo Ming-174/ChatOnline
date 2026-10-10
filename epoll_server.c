@@ -18,14 +18,33 @@
 * 必须在读取到消息头要求的消息体，才能进行广播，这期间消息头和消息体会被存在conn
 */
 
+/*
+当前支持不同类型数据包，数据包使用统一格式
+[数据体长度][数据类型][数据体]
+数据体采用uint32_t类型，数据类型使用MSG宏,不同的数据类型会有不同的数据体处理方法
+
+服务器接收的MSG_CHAT类型[数据体]:
+[消息长度][消息]
+服务器发送的MSG_CHAT类型[数据体]:
+[用户名长度][用户名][消息]
+[用户名长度]和[用户名]在客户端初始链接时通过一系列操作建立后保存在服务器内，发送时通过服务器内部代码加工进发送的数据包
+*/
+
 #define MAX_EVENTS 128	//最大同时处理响应链接数
 #define MAX_CLIENTS 1024	//最大客户端链接数
 #define MAX_PACKET 1024		//单个数据包最大大小
 #define RCBUF_SIZE (2 * MAX_PACKET + 4 )	//接收缓冲区长度
 #define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
+#define MAX_NAME 32		//最长名字
 
 #define MAX_LEN 1024	
 int epfd;
+
+#define MSG_REGIS 0
+#define MSG_LOGIN 1
+#define MSG_LOGOUT 2
+#define MSG_CHAT 3
+#define MSG_NOTICE 4
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
@@ -38,6 +57,10 @@ typedef struct Conn {
 	char sdbuf[SDBUF_SIZE];
 	//发送缓冲区的长度
 	int sdlen;
+	//客户端用名
+	char name[MAX_NAME];
+	//名字长度
+	uint32_t name_len;
 }Conn;
 
 Conn conns[MAX_CLIENTS];
@@ -50,11 +73,16 @@ Conn* conn_insert(int fd) {
 			conns[i].fd = fd;
 			conns[i].rclen = 0;
 			conns[i].sdlen = 0;
+			memcpy(conns[i].name, "unknow", 6);
+			conns[i].name_len = 0;
 			return &conns[i];
 		}
 	}
 	return NULL;
 }
+
+void notice(Conn* conn, uint8_t type, const char* buf);
+void packet_dispatch(Conn* conn);
 
 void set_nonblock(int fd) {
 	int flag = fcntl(fd, F_GETFL, 0);
@@ -72,6 +100,8 @@ void clean(Conn* conn) {
 	conn->fd = -1;
 	conn->rclen = 0;
 	conn->sdlen = 0;
+	memcpy(conn->name, "unknow", 6);
+	conn->name_len = 6;
 	close(fd);
 	printf("Client:%d disconnect\n", fd);
 }
@@ -121,15 +151,18 @@ int recv_clear(Conn* conn) {
 	}
 }
 
-//消息消费,将c1缓冲区内的一条数据完整的搬进c2，并进行指针偏移
-void msg_cpy(Conn* c1, Conn* c2, int len) {
+//将一条数据完整的搬进conn，并进行指针偏移
+void msg_cpy(char*buf, int length, Conn* conn) {
 	//如果连接的用户态缓冲区不足，就直接放弃这个包,执行静默丢包
 	//不可以说能塞多少塞多少，这会导致没塞下的包被丢失后，客户端协议永远没办法解析完整这个包，实际上导致解析错乱，把别的数据包的消息头拿去解析了
-	if (SDBUF_SIZE - c2->sdlen < len)return;
+	if (SDBUF_SIZE - conn->sdlen < length) {
+		printf("Client:%d %.*s space no enough,drop packet\n", conn->fd, conn->name_len, conn->name);
+		return;
+	}
 
 	//谨记不是每个数组都是空的，可能有旧数据存留
-	memcpy(c2->sdbuf + c2->sdlen, c1->rcbuf, len);
-	c2->sdlen += len;
+	memcpy(conn->sdbuf + conn->sdlen, buf, length);
+	conn->sdlen += length;
 }
 
 //发送：三种结果，内核缓冲区满send终止，sdbuf完全发送，或者两种同时发生
@@ -206,10 +239,10 @@ void flush(Conn* conn) {
 }
 //广播
 //遍历整个conns列表，如果不是空的，也不是消息发送者本人，就进行发送，用flush能更好的发送（使用send清理sdbuf，还可以进行状态注册）
-void broadcast(Conn* conn, int len) {
+void broadcast(int fd,char*buf,int length){
 	for (int i = 0; i < MAX_CLIENTS; i++) {
-		if (conns[i].fd != -1 && &conns[i] != conn) {
-			msg_cpy(conn, &conns[i], len);
+		if (conns[i].fd != -1 && conns[i].fd!=fd) {
+			msg_cpy(buf, length, &conns[i]);
 			flush(&conns[i]);
 		}
 	}
@@ -229,38 +262,187 @@ void handler(Conn* conn) {
 		clean(conn);
 		return;
 	}
-	while(conn->rclen >= 4) {		//头完整，再进入消息体判断
-		uint32_t net_len;
+	while(conn->rclen >= 5) {		//头完整，再进入消息体判断
+		uint32_t body_len;
 
 		//将rcbuf里取出头4个字节放进net_len
-		memcpy(&net_len, conn->rcbuf, 4);
-		uint32_t len = ntohl(net_len);
+		memcpy(&body_len, conn->rcbuf, 4);
+		body_len = ntohl(body_len);
 
 		//非法大包，直接关闭违规客户端
-		if (len > MAX_PACKET - 4) {
+		if (body_len + 5 > MAX_PACKET) {
+			char* buf = "Your package is over size";
+			notice(conn, MSG_NOTICE, buf);
 			printf("Invalid package!\n");
 			clean(conn);
 			break;
 		}
 
+		//防止空包,空包直接清除这个数据包
+		if (body_len == 0) {
+			conn->rclen -= 5;
+			memmove(conn->rcbuf, conn->rcbuf + 5, conn->rclen);
+			continue;
+		}
+
 		//判断消息体长度是否为消息头要求的长度
-		if (conn->rclen >= len + 4) {
-			//防止空包
-			if (len > 0) {
-				//广播，将信息挨个拷贝进缓冲区，再flush刷新缓冲区
-				broadcast(conn, len + 4);
+		if (conn->rclen >= body_len + 5) {
+			packet_dispatch(conn);
+		}
 
-				//广播完毕，原消息缓冲区清理
-				printf("%d:%.*s\n", conn->fd, len, conn->rcbuf + 4);
+		//不完整数据包
+		else if (conn->rclen < body_len + 5 ) {
+			break;
+		}
+	}
+}
+
+//数据包分拣中心，所有的数据在被确定为一个数据包后,链接conn会进入分拣中心，确认数据包类型，根据数据包类型进行不同操作
+void packet_dispatch(Conn* conn) {
+	//解析消息体长度
+	uint32_t len;
+	memcpy(&len, conn->rcbuf, sizeof(len));
+	len = ntohl(len);
+	//获取数据类型
+	uint8_t type;
+	memcpy(&type, conn->rcbuf + 4, 1);
+	//分拣
+	if (type == MSG_REGIS) {
+		//检查名字是否合规
+		if (len > 32) {
+			//回信不合规名字
+			char* buf1 = "Your name is invalid,try again";
+			notice(conn, MSG_NOTICE, buf1);
+			//再次要求注册
+			char* buf2 = "Please enter your name:";
+			notice(conn, MSG_REGIS, buf2);
+			//清理不合规名字
+			conn->rclen -= len + 5;
+			memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
+			return;
+		}
+		//[len][MSG_REGIS][NAME]
+		memcpy(conn->name, conn->rcbuf + 4 + 1, len);
+		conn->name_len = len;
+		printf("Client:%d Name:%.*s", conn->fd, len, conn->rcbuf+5);
+		conn->rclen -= 5 + len;
+		memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
+	}
+	else if (type == MSG_CHAT) {
+		//[len1][type][msg] --> [len2][type][name_len][name][msg]
+		//length全长 body_len拼装后消息体长度 len原数据包消息体长度
+		//计算新消息体长度
+		uint32_t body_len = len + conn->name_len + sizeof(conn->name_len);
+		int length = (int)body_len + 5;
+		body_len = htonl(body_len);
+
+		//开始构造新数据包
+		char buf[SDBUF_SIZE];
+		char* p = buf;
+
+		//制作新消息头
+		memcpy(p, &body_len, sizeof(body_len));
+		p += sizeof(body_len);
+
+		//放入type
+		*p = MSG_CHAT;
+		p += 1;
+
+		//放入用户名长度（转大端序）
+		uint32_t namelen = htonl(conn->name_len);
+		memcpy(p, &namelen, sizeof(namelen));
+		p += sizeof(namelen);
+
+		//放入用户名
+		memcpy(p, conn->name, conn->name_len);
+		p += conn->name_len;
+
+		//放入消息
+		memcpy(p, conn->rcbuf + 5, len);
+		p += len;
+
+		broadcast(conn->fd, buf, length);
+
+		//消费消息
+		conn->rclen -= 5 + len;
+		memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
+	}
+	//不明类型数据包，直接挂断链接
+	else {
+		char* buf = "Your packet is unclear";
+		notice(conn, MSG_NOTICE, buf);
+		clean(conn);
+	}
+}
+
+//服务器特供回信
+void notice(Conn* conn, uint8_t type, const char* buf) {
+	//检查
+	if (strlen(buf) + 5 > SDBUF_SIZE - conn->sdlen) {
+		printf("Unable to notice: conn's send space no enough\n");
+		return;
+	}
+
+	char* p = conn->sdbuf;
+	p += conn->sdlen;
+
+	//构造消息头
+	uint32_t len = htonl(strlen(buf));
+	memcpy(p, &len, sizeof(len));
+	p += sizeof(len);
+
+	//注册消息类型
+	*p = type;
+	p += 1;
+
+	//注入消息体
+	memcpy(p, buf, strlen(buf));
+	conn->sdlen += sizeof(len) + 1 + strlen(buf);
+
+	//发送
+	flush(conn);
+}
+
+void accept_client(Conn* conn) {
+	while (1) {
+		int client_fd = accept(conn->fd, NULL, NULL);
+		if (client_fd < 0) {
+			//没有新连接
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				break;
 			}
-			memmove(conn->rcbuf, conn->rcbuf + len + 4, conn->rclen - len - 4);
-			conn->rclen -= len + 4;
+			//被系统打断就重试
+			if (errno == EINTR) {
+				continue;
+			}
+			perror("accept");
+			break;
 		}
 
-		else if (conn->rclen < len + 4) {
-		//非完整数据包
-		break;
+		//创建新链接，初始化链接，并将新链接放入conns
+		Conn* new_conn = conn_insert(client_fd);
+		//如果连接的客户端满了，直接放弃剩下想要连接的客户端
+		if (new_conn == NULL) {
+			printf("Connection is full\n");
+			close(client_fd);
+			break;
 		}
+
+		//设置非阻塞IO
+		set_nonblock(client_fd);
+
+		//放入epoll
+		struct epoll_event cli;
+		cli.data.ptr = new_conn;
+		cli.events = (EPOLLIN | EPOLLRDHUP);
+		epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
+
+		//新连接就绪
+		printf("Client:%d connected\n", client_fd);
+
+		//特供回信:要求注册
+		char* buf = "Please enter your name:";
+		notice(new_conn, MSG_REGIS, buf);
 	}
 }
 
@@ -336,45 +518,11 @@ int main() {
 		}
 		for (int i = 0; i < n; i++) {
 			Conn* conn = events[i].data.ptr;
-			//有新连接
+			//新连接请求
 			if (conn == &server_conn) {
-				while(1){
-					int client_fd = accept(conn->fd, NULL, NULL);
-					if (client_fd < 0) {
-						//没有新连接
-						if (errno == EAGAIN || errno == EWOULDBLOCK) {
-							break;
-						}
-						//被系统打断就重试
-						if (errno == EINTR) {
-							continue;
-						}
-						perror("accept");
-						break;
-					}
-
-					//创建新链接，初始化链接，并将新链接放入conns
-					Conn* new_conn = conn_insert(client_fd);
-					//如果连接的客户端满了，直接放弃剩下想要连接的客户端
-					if (new_conn == NULL) {
-						printf("Connection is full\n");
-						close(client_fd);
-						break;
-					}
-
-					//设置非阻塞IO
-					set_nonblock(client_fd);
-
-					//放入epoll
-					struct epoll_event cli;
-					cli.data.ptr = new_conn;
-					cli.events = (EPOLLIN | EPOLLRDHUP);
-					epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
-
-					//新连接就绪
-					printf("Client:%d connected\n", client_fd);
-				}
+				accept_client(conn);
 			}
+			//已连接客户端请求
 			else {
 				int e = events[i].events;
 				if (conn->fd == -1)continue;
