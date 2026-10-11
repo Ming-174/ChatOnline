@@ -24,10 +24,18 @@
 数据体采用uint32_t类型，数据类型使用MSG宏,不同的数据类型会有不同的数据体处理方法
 
 服务器接收的MSG_CHAT类型[数据体]:
-[消息长度][消息]
+[消息]
 服务器发送的MSG_CHAT类型[数据体]:
 [用户名长度][用户名][消息]
 [用户名长度]和[用户名]在客户端初始链接时通过一系列操作建立后保存在服务器内，发送时通过服务器内部代码加工进发送的数据包
+
+MSG_NOTICE类型是服务器专用回信类型，专门用来给客户端发送提示用的
+MSG_NOTICE的[数据体]:
+[消息]
+
+MSG_REGIS类型是新客户端用于登录时的类型，同时被服务器与客户端使用
+MSG_REGIS类型的[数据体]:
+[消息]
 */
 
 #define MAX_EVENTS 128	//最大同时处理响应链接数
@@ -64,7 +72,15 @@ typedef struct Conn {
 }Conn;
 
 Conn conns[MAX_CLIENTS];
+
+int notice(Conn* conn, uint8_t type, const char* buf);
+int packet_dispatch(Conn* conn);
+
 //非阻塞IO设置
+void set_nonblock(int fd) {
+	int flag = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+}
 
 //先在整个conns名单遍历一遍，找到空位后将这个连接初始化，再放入，这个放入的位置idx几乎是随机，只是按顺序找空位，他所处的位置不再代表任何含义
 Conn* conn_insert(int fd) {
@@ -81,13 +97,6 @@ Conn* conn_insert(int fd) {
 	return NULL;
 }
 
-void notice(Conn* conn, uint8_t type, const char* buf);
-void packet_dispatch(Conn* conn);
-
-void set_nonblock(int fd) {
-	int flag = fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, flag | O_NONBLOCK);
-}
 //清理
 void clean(Conn* conn) {
 	if (conn->fd == -1) {
@@ -101,7 +110,7 @@ void clean(Conn* conn) {
 	conn->rclen = 0;
 	conn->sdlen = 0;
 	memcpy(conn->name, "unknow", 6);
-	conn->name_len = 6;
+	conn->name_len = 0;
 	close(fd);
 	printf("Client:%d disconnect\n", fd);
 }
@@ -213,13 +222,14 @@ int send_clear(Conn* conn) {
 }
 //当broadcast的时候调用，用来尝试发送数据，如果发送不完，而唯一发不完的正常情况就是内核发送缓冲区满了
 //当main调用的时候，就是复核，这时候的发送的内核缓冲区可用，再次尝试发送
-void flush(Conn* conn) {
-	if (conn->fd == -1)return;
+int flush(Conn* conn) {
+	//返回-1代表这个链接已经关闭，不可再用，上级程序应该采取其他操作
+	if (conn->fd == -1)return -1;
 	int sd = send_clear(conn);
 	if (sd < 0) {
 		perror("send");
-		clean(conn);
-		return;
+		//返回-1代表这个链接已经关闭，不可再用，上级程序应该采取其他操作
+		return -1;
 	}
 	struct epoll_event ev;
 	ev.data.ptr = conn;
@@ -236,6 +246,8 @@ void flush(Conn* conn) {
 		ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
 	}
 	epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
+	//返回1代表正常
+	return 1;
 }
 //广播
 //遍历整个conns列表，如果不是空的，也不是消息发送者本人，就进行发送，用flush能更好的发送（使用send清理sdbuf，还可以进行状态注册）
@@ -243,7 +255,8 @@ void broadcast(int fd,char*buf,int length){
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		if (conns[i].fd != -1 && conns[i].fd!=fd) {
 			msg_cpy(buf, length, &conns[i]);
-			flush(&conns[i]);
+			int n = flush(&conns[i]);
+			if (n == -1)clean(&conns[i]);
 		}
 	}
 }
@@ -255,7 +268,7 @@ void broadcast(int fd,char*buf,int length){
 //能拷贝得下就拷贝，拷贝不下就丢包
 //拷贝完就刷新sdbuf缓冲区
 
-//handler负责切开数据，分成一个一个的数据包，再交给broadcast
+//handler负责切开数据，分成一个一个的数据包，再交给packet_dispatch
 void handler(Conn* conn) {
 	int n = recv_clear(conn);
 	if (n == -1) {		//连接失败或关闭
@@ -270,7 +283,7 @@ void handler(Conn* conn) {
 		body_len = ntohl(body_len);
 
 		//非法大包，直接关闭违规客户端
-		if (body_len + 5 > MAX_PACKET) {
+		if (body_len > MAX_PACKET - 5) {
 			char* buf = "Your package is over size";
 			notice(conn, MSG_NOTICE, buf);
 			printf("Invalid package!\n");
@@ -286,19 +299,31 @@ void handler(Conn* conn) {
 		}
 
 		//判断消息体长度是否为消息头要求的长度
-		if (conn->rclen >= body_len + 5) {
-			packet_dispatch(conn);
+		if (conn->rclen - 5 >= body_len) {
+			int X = packet_dispatch(conn);
+			//现将数据包执行结果分为两种，一种是正常运行，正常运行并不一定指数据包达到了他的目的，即使没办法达到目的也属于正常运行的结果，统一进入消费环节
+			//一种是致命失败，致命失败是需要直接进入清理程序的
+			if (X == -1) {
+				//致命失败，直接关闭链接
+				clean(conn);
+				break;
+			}
+			else if (X == 1) {
+				//正常运行，消费数据包
+				conn->rclen -= 5 + body_len;
+				memmove(conn->rcbuf, conn->rcbuf + body_len + 5, conn->rclen);
+			}
 		}
 
 		//不完整数据包
-		else if (conn->rclen < body_len + 5 ) {
+		else if (conn->rclen - 5 < body_len) {
 			break;
 		}
 	}
 }
 
 //数据包分拣中心，所有的数据在被确定为一个数据包后,链接conn会进入分拣中心，确认数据包类型，根据数据包类型进行不同操作
-void packet_dispatch(Conn* conn) {
+int packet_dispatch(Conn* conn) {
 	//解析消息体长度
 	uint32_t len;
 	memcpy(&len, conn->rcbuf, sizeof(len));
@@ -310,23 +335,36 @@ void packet_dispatch(Conn* conn) {
 	if (type == MSG_REGIS) {
 		//检查名字是否合规
 		if (len > 32) {
+
 			//回信不合规名字
 			char* buf1 = "Your name is invalid,try again";
-			notice(conn, MSG_NOTICE, buf1);
+			int X = notice(conn, MSG_NOTICE, buf1);
+			if (X == -1) {
+				return -1;
+			}
+
 			//再次要求注册
 			char* buf2 = "Please enter your name:";
-			notice(conn, MSG_REGIS, buf2);
+			X = notice(conn, MSG_REGIS, buf2);
+			if (X == -1) {
+				return -1;
+			}
+			/*
 			//清理不合规名字
 			conn->rclen -= len + 5;
 			memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
-			return;
+			*/
+			return 1;
 		}
 		//[len][MSG_REGIS][NAME]
 		memcpy(conn->name, conn->rcbuf + 4 + 1, len);
 		conn->name_len = len;
 		printf("Client:%d Name:%.*s", conn->fd, len, conn->rcbuf+5);
+		/*
 		conn->rclen -= 5 + len;
 		memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
+		*/
+		return 1;
 	}
 	else if (type == MSG_CHAT) {
 		//[len1][type][msg] --> [len2][type][name_len][name][msg]
@@ -364,23 +402,28 @@ void packet_dispatch(Conn* conn) {
 		broadcast(conn->fd, buf, length);
 
 		//消费消息
+		/*
 		conn->rclen -= 5 + len;
 		memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
+		*/
+		return 1;
 	}
 	//不明类型数据包，直接挂断链接
 	else {
 		char* buf = "Your packet is unclear";
 		notice(conn, MSG_NOTICE, buf);
-		clean(conn);
+		//无论如何都要clean，notice返回值可以不必检查
+		return -1;
 	}
 }
 
 //服务器特供回信
-void notice(Conn* conn, uint8_t type, const char* buf) {
+//返回1为执行成功，-1为致命失败
+int notice(Conn* conn, uint8_t type, const char* buf) {
 	//检查
 	if (strlen(buf) + 5 > SDBUF_SIZE - conn->sdlen) {
 		printf("Unable to notice: conn's send space no enough\n");
-		return;
+		return 1;//这里的1不代表完成任务，只代表运行正常，但确实是无法达到结果
 	}
 
 	char* p = conn->sdbuf;
@@ -400,7 +443,9 @@ void notice(Conn* conn, uint8_t type, const char* buf) {
 	conn->sdlen += sizeof(len) + 1 + strlen(buf);
 
 	//发送
-	flush(conn);
+	int n = flush(conn);
+	if (n == -1)return -1;
+	return 1;
 }
 
 void accept_client(Conn* conn) {
@@ -442,7 +487,8 @@ void accept_client(Conn* conn) {
 
 		//特供回信:要求注册
 		char* buf = "Please enter your name:";
-		notice(new_conn, MSG_REGIS, buf);
+		int X = notice(new_conn, MSG_REGIS, buf);
+		if (X == -1)clean(new_conn);
 	}
 }
 
@@ -538,8 +584,13 @@ int main() {
 				}
 				//客户端发送消息
 				if (e & EPOLLIN && conn->fd!=-1)handler(conn);
+
 				//向客户端发送消息
-				if (e & EPOLLOUT && conn->fd != -1)flush(conn);
+				if (e & EPOLLOUT && conn->fd != -1) {
+					int x = flush(conn);
+					if (x == -1)clean(conn);
+				}
+
 				//客户端正常挂断（未触发EPOLLIN特殊情况兜底）
 				//必须要添加非EPOLLIN情况判断，客户端发送Fin后系统会立刻上报EPOLLIN|EPOLLRDHUP
 				//如果内核缓冲区的数据还没被读取完，而我们直接通过EPOLLRDHUP关闭链接，会导致内核缓冲区的数据丢失
@@ -559,5 +610,4 @@ int main() {
 //增加半包链接的心跳程序
 //安排压力测试
 //优化sdbuf成双指针
-//调整broadcast
 //增加日志
