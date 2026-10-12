@@ -73,9 +73,18 @@ typedef struct Conn {
 	char name[MAX_NAME];
 	//名字长度
 	uint32_t name_len;
+	//连接状态
+	int status;		//-1故障  0未启用  1启用且正常
 }Conn;
 
+//已连接客户端
 Conn conns[MAX_CLIENTS];
+
+//处决名单
+//故障链接处理机制：
+//一、若为当前事件响应链接故障，则在该事件响应回合内进行处理
+//二、若为非当前事件响应链接，则将其标记后放入故障名单内，待该轮事件响应结束后统一进行处理
+Conn* fault_list[MAX_CLIENTS];
 
 int notice(Conn* conn, uint8_t type, const char* buf);
 int packet_dispatch(Conn* conn);
@@ -95,10 +104,26 @@ Conn* conn_insert(int fd) {
 			conns[i].sdlen = 0;
 			memcpy(conns[i].name, "unknow", 6);
 			conns[i].name_len = 0;
+			conns[i].status = 1;
 			return &conns[i];
 		}
 	}
 	return NULL;
+}
+
+//故障链接标记以及入队
+void report(Conn* conn) {
+	conn->status = -1;
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		//查看当前位置是否为空位，该链接是否已插入
+		if (fault_list[i] == NULL){	
+			if (fault_list[i]->fd != conn->fd) {
+				fault_list[i] = conn;
+				printf("Client:%d %.*s has been push into fault list\n", conn->fd, conn->name_len, conn->name);
+				break;
+			}
+		}
+	}
 }
 
 //清理
@@ -113,6 +138,7 @@ void clean(Conn* conn) {
 	conn->fd = -1;
 	conn->rclen = 0;
 	conn->sdlen = 0;
+	conn->status = 0;
 	memcpy(conn->name, "unknow", 6);
 	conn->name_len = 0;
 	close(fd);
@@ -258,10 +284,15 @@ int flush(Conn* conn) {
 //遍历整个conns列表，如果不是空的，也不是消息发送者本人，就进行发送，用flush能更好的发送（使用send清理sdbuf，还可以进行状态注册）
 void broadcast(int fd,char*buf,int length){
 	for (int i = 0; i < MAX_CLIENTS; i++) {
+		//检查链接状态
+		if (conns[i].status == -1 || conns[i].status == 0) {
+			continue;
+		}
+		//检查槽位是否有链接
 		if (conns[i].fd != -1 && conns[i].fd!=fd) {
 			msg_cpy(buf, length, &conns[i]);
 			int n = flush(&conns[i]);
-			if (n == -1)clean(&conns[i]);
+			if (n == -1)report(&conns[i]);
 		}
 	}
 }
@@ -275,6 +306,11 @@ void broadcast(int fd,char*buf,int length){
 //在功能模块完成工作后，将处理结果上报回handler，除了handler之外，不允许任何来自客户端的数据包被擅自处理，而是统一归到handler处理
 //注：部分由服务器构造的数据包会直发至客户端，不经过handler，这类数据包通常不需要通过消费来进行对内存空间的调整
 void handler(Conn* conn) {
+	//检查当前链接状态
+	if (conn->status == -1 || conn->status == 0) {
+		return;
+	}
+
 	int n = recv_clear(conn);
 	if (n == -1) {		//连接失败或关闭
 		clean(conn);
@@ -523,6 +559,11 @@ int main() {
 		conns[i].fd = -1;
 		conns[i].sdlen = 0;
 		conns[i].rclen = 0;
+		conns[i].status = 0;
+	}
+
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		fault_list[i] = NULL;
 	}
 
 	//设置服务器接听链接非阻塞，可以一口气接听多个连线
@@ -533,6 +574,7 @@ int main() {
 	server_conn.fd = server_fd;
 	server_conn.rclen = 0;
 	server_conn.sdlen = 0;
+	server_conn.status = 0;
 
 	//epoll TL建立
 	epfd = epoll_create(1);
@@ -594,6 +636,14 @@ int main() {
 					clean(conn);
 				}
 			}
+		}
+		//事件响应轮结束，故障链接统一清理
+		for (int i = 0; i < MAX_CLIENTS; i++) {
+			if (fault_list[i] != NULL) {
+				clean(fault_list[i]);
+				fault_list[i] = NULL;
+			}
+			else if (fault_list[i] == NULL)break;
 		}
 	}
 	//暂未设定如何关闭服务器
