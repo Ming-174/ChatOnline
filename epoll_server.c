@@ -11,31 +11,36 @@
 #include<signal.h>
 #include<stdint.h>
 /*
-* 协议头：消息体的长度，通过uint32储存，用n-h转型
-* 消息体：具体的数据包
-* 消息头与消息体是一体数据包
-* 协议层应该在先读取一次协议头，再按协议头读取协议体
-* 必须在读取到消息头要求的消息体，才能进行广播，这期间消息头和消息体会被存在conn
-*/
+协议定义：
 
-/*
-当前支持不同类型数据包，数据包使用统一格式
-[数据体长度][数据类型][数据体]
-数据体采用uint32_t类型，数据类型使用MSG宏,不同的数据类型会有不同的数据体处理方法
+数据包的类型有所不同，但所有数据包都使用固定的统一格式:
+[数据头][数据类型][数据体]
 
-服务器接收的MSG_CHAT类型[数据体]:
-[消息]
-服务器发送的MSG_CHAT类型[数据体]:
-[用户名长度][用户名][消息]
-[用户名长度]和[用户名]在客户端初始链接时通过一系列操作建立后保存在服务器内，发送时通过服务器内部代码加工进发送的数据包
+[数据头]数据头Header，uint32_t的4字节32位二进制，用来表示数据体的长度，所以又称“数据体长度”
+[数据类型]数据类型Type，uint_t的1字节8位二进制，用来表示数据体的类型
+[数据体]数据体是有效数据，他根据不同的type有不同的结构，需要做不同的操作
 
-MSG_NOTICE类型是服务器专用回信类型，专门用来给客户端发送提示用的
-MSG_NOTICE的[数据体]:
-[消息]
+简单来说数据头是讲数据体有多长的，数据类型是讲数据是哪一类的、用来干什么的，数据体就是要被拿来使用的数据本身
+但数据体实际上内部结构也有所不同，需要根据不同的类型进行其他的操作，可能还需要进一步解析等等
 
-MSG_REGIS类型是新客户端用于登录时的类型，同时被服务器与客户端使用
-MSG_REGIS类型的[数据体]:
-[消息]
+几种不同的Type对应的数据体结构：
+
+	MSG_CHAT:
+		服务器接收的MSG_CHAT类型[数据体]:
+		[文本消息]
+		服务器发送的MSG_CHAT类型[数据体]:
+		[用户名长度][用户名][文本消息]
+		[用户名长度]和[用户名]在客户端初始链接时通过一系列操作建立后保存在服务器内，发送时通过服务器内部代码加工进发送的数据包
+	
+	MSG_NOTICE:
+		MSG_NOTICE类型是服务器专用回信类型，专门用来给客户端发送提示用的
+		MSG_NOTICE的[数据体]:
+		[文本消息]
+	
+	MSG_REGIS:
+		MSG_REGIS类型是新客户端用于登录时的类型，同时被服务器与客户端使用
+		MSG_REGIS类型的[数据体]:
+		[文本消息]
 */
 
 #define MAX_EVENTS 128	//最大同时处理响应链接数
@@ -45,7 +50,6 @@ MSG_REGIS类型的[数据体]:
 #define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
 #define MAX_NAME 32		//最长名字
 
-#define MAX_LEN 1024	
 int epfd;
 
 #define MSG_REGIS 0
@@ -176,7 +180,7 @@ void msg_cpy(char*buf, int length, Conn* conn) {
 
 //发送：三种结果，内核缓冲区满send终止，sdbuf完全发送，或者两种同时发生
 //三种返回值代表三种情况
-//1.返回0，代表可发送的数据为0
+//1.返回0，代表发送的数据为0
 //2.返回>0，代表有数据正常发送，但不一定是将sdbuf里所有东西都发送了，不代表发送了一个完整的数据包
 //  这种情况要么就是发送缓冲区已满，要么就是sdbuf被清空了
 //3.返回-1，代表出错
@@ -203,6 +207,7 @@ int send_clear(Conn* conn) {
 			else {
 				//其他情况
 				//此处并不应该clean，应该交给上级
+				//消费掉出错之前发送的数据，虽然没什么必要，因为一出错，就挂断，数据已经没有再次使用的可能性了
 				conn->sdlen -= sent;
 				memmove(conn->sdbuf, conn->sdbuf + sent, conn->sdlen);
 				return -1;
@@ -220,7 +225,7 @@ int send_clear(Conn* conn) {
 	conn->sdlen -= sent;
 	return sent;
 }
-//当broadcast的时候调用，用来尝试发送数据，如果发送不完，而唯一发不完的正常情况就是内核发送缓冲区满了
+//当broadcast的时候调用，用来尝试发送数据，如果发送不完，而唯一发不完的正常情况就是内核发送缓冲区满了导致sdbuf堆积严重
 //当main调用的时候，就是复核，这时候的发送的内核缓冲区可用，再次尝试发送
 int flush(Conn* conn) {
 	//返回-1代表这个链接已经关闭，不可再用，上级程序应该采取其他操作
@@ -261,21 +266,21 @@ void broadcast(int fd,char*buf,int length){
 	}
 }
 
-//协议解析
 //recv和send板块只负责尽可能从缓冲区拿出和放入数据，而拿出数据是不是一条数据包，发送的是不是一条数据包他们不处理
-//协议解析层负责：
-//判断rcbuf是否有一个完整的数据包，有的话就拷贝给各个链接的sdbuf缓冲区
-//能拷贝得下就拷贝，拷贝不下就丢包
-//拷贝完就刷新sdbuf缓冲区
 
-//handler负责切开数据，分成一个一个的数据包，再交给packet_dispatch
+//handler是所有数据包的审查中心，他负责接管原数据包的全部问题
+//先调用接收器执行连接的EPOLLIN响应请求，接受完数据就进入数据包审查
+//审查阶段会对数据包进行解析，判断其是否为一个完整的数据包，数据包是否非法，是否为空包
+//通过审查后，将数据包原封不动地交给packet_dispatch进行分拣，再由分拣将数据包交给各个功能模块
+//在功能模块完成工作后，将处理结果上报回handler，除了handler之外，不允许任何来自客户端的数据包被擅自处理，而是统一归到handler处理
+//注：部分由服务器构造的数据包会直发至客户端，不经过handler，这类数据包通常不需要通过消费来进行对内存空间的调整
 void handler(Conn* conn) {
 	int n = recv_clear(conn);
 	if (n == -1) {		//连接失败或关闭
 		clean(conn);
 		return;
 	}
-	while(conn->rclen >= 5) {		//头完整，再进入消息体判断
+	while(conn->rclen >= 5) {		//头完整，再进入数据体判断
 		uint32_t body_len;
 
 		//将rcbuf里取出头4个字节放进net_len
@@ -298,7 +303,7 @@ void handler(Conn* conn) {
 			continue;
 		}
 
-		//判断消息体长度是否为消息头要求的长度
+		//判断数据体长度是否为数据头要求的长度
 		if (conn->rclen - 5 >= body_len) {
 			int X = packet_dispatch(conn);
 			//现将数据包执行结果分为两种，一种是正常运行，正常运行并不一定指数据包达到了他的目的，即使没办法达到目的也属于正常运行的结果，统一进入消费环节
@@ -324,7 +329,7 @@ void handler(Conn* conn) {
 
 //数据包分拣中心，所有的数据在被确定为一个数据包后,链接conn会进入分拣中心，确认数据包类型，根据数据包类型进行不同操作
 int packet_dispatch(Conn* conn) {
-	//解析消息体长度
+	//解析数据体长度
 	uint32_t len;
 	memcpy(&len, conn->rcbuf, sizeof(len));
 	len = ntohl(len);
@@ -349,29 +354,25 @@ int packet_dispatch(Conn* conn) {
 			if (X == -1) {
 				return -1;
 			}
-			/*
-			//清理不合规名字
-			conn->rclen -= len + 5;
-			memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
-			*/
 			return 1;
 		}
 		//[len][MSG_REGIS][NAME]
 		memcpy(conn->name, conn->rcbuf + 4 + 1, len);
 		conn->name_len = len;
 		printf("Client:%d Name:%.*s", conn->fd, len, conn->rcbuf+5);
-		/*
-		conn->rclen -= 5 + len;
-		memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
-		*/
 		return 1;
 	}
 	else if (type == MSG_CHAT) {
 		//[len1][type][msg] --> [len2][type][name_len][name][msg]
-		//length全长 body_len拼装后消息体长度 len原数据包消息体长度
-		//计算新消息体长度
+		//length数据包全长 body_len拼装后数据体长度 len原数据包数据体长度
+		//计算新数据体长度
 		uint32_t body_len = len + conn->name_len + sizeof(conn->name_len);
 		int length = (int)body_len + 5;
+		if (length > MAX_PACKET) {
+			char* buf = "Your packet is to long,please send a shorter packet!";
+			notice(conn, MSG_NOTICE, buf);//不保证送达
+			return 1;
+		}
 		body_len = htonl(body_len);
 
 		//开始构造新数据包
@@ -401,11 +402,6 @@ int packet_dispatch(Conn* conn) {
 
 		broadcast(conn->fd, buf, length);
 
-		//消费消息
-		/*
-		conn->rclen -= 5 + len;
-		memmove(conn->rcbuf, conn->rcbuf + 5 + len, conn->rclen);
-		*/
 		return 1;
 	}
 	//不明类型数据包，直接挂断链接
@@ -606,8 +602,23 @@ int main() {
 	return 0;
 }
 
+//日志
+//很多功能都改了，注释还没修改
+//还没添加包大小上限处理
+//packet_dispatch还没将功能切割
+
+
 //计划
-//增加半包链接的心跳程序
-//安排压力测试
-//优化sdbuf成双指针
-//增加日志
+
+// 统一故障链接处理机制，保证链接生命周期的确定性，增加处决队列，举报机制，不再在非当前事件响应时直接清理故障链接，而是统一事件响应轮结束时 
+
+// 改进发送缓冲区不足时的处理机制，不应该再默认丢包
+// 此改进可以解决notice不保证送达的问题，更从根源上解决此类“目的不一定达成，运行一定完成”的问题
+
+// 增加半包链接的心跳程序
+ 
+// 安排压力测试
+ 
+// 优化sdbuf成双指针
+ 
+// 增加日志
