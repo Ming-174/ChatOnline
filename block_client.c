@@ -7,7 +7,27 @@
 #include<stdint.h>
 #include<pthread.h>
 #include<signal.h>
+
+#define MSG_REGIS 0
+#define MSG_LOGIN 1
+#define MSG_LOGOUT 2
+#define MSG_CHAT 3
+#define MSG_NOTICE 4
+#define MSG_RECOGISE 5
+
+#define MAX_PACKET 1024
+
+#define STA_WAIT 0
+#define STA_REGISING 1
+#define STA_RECOGISE 2
+#define STA_CLOSE -1
+
+int status = STA_WAIT;
+
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+
+//保证将buf的size字节发送
 int write_exact(int fd, char* buf, size_t size) {
 	ssize_t ret = 0;
 	while (ret < size) {
@@ -18,16 +38,17 @@ int write_exact(int fd, char* buf, size_t size) {
 	return ret;
 }
 
-int send_package(int fd, char* buf) {
-	uint32_t len = htonl(strlen(buf));
+/*int send_package(int fd, char* buf, int Len); {
+	uint32_t len = htonl(Len);
 	int r = write_exact(fd, (char*)&len, sizeof(len));
 	if (r < 0)return -1;
 
-	r = write_exact(fd, buf, strlen(buf));
+	r = write_exact(fd, buf, Len);
 	if (r < 0)return -1;
 	return r;
-}
+}*/
 
+//从内核缓冲区拿出size字节
 int read_exact(int fd, char* buf, size_t size) {
 	ssize_t got = 0;
 	while (got < size) {
@@ -38,17 +59,20 @@ int read_exact(int fd, char* buf, size_t size) {
 	}
 	return (int)got;
 }
-//发送的时候，是将h转网络格式，read_exact并不会帮我转会来，只会照样读取
 //所以我需要手动将网络格式转回来
-int recv_package(int fd, char* buf, int max_len) {
+//recv_packet会首先解析一次数据包，获得数据头并解析长度后，再根据数据头，将数据类型和数据体收取入buf内
+int recv_package(int fd, char* buf) {
 	uint32_t net_len;
+	//读取4字节数据头
 	int r = read_exact(fd, (char*)&net_len, sizeof(net_len));
 	if (r <= 0)return r;
 
+	//转码4字节数据头
 	uint32_t len = ntohl(net_len);
-	if (len >= max_len)return -2;
+	if (len > MAX_PACKET - 5)return -2;
 
-	r = read_exact(fd, buf, len);
+	//读取数据类型和数据体
+	r = read_exact(fd, buf, len + 1);
 	if (r <= 0)return r;
 
 	return r;
@@ -57,8 +81,8 @@ int recv_package(int fd, char* buf, int max_len) {
 void* handler(void* arg) {
 	int client_fd = (int)(intptr_t)arg;
 	while (1) {
-		char buf[1024] = { 0 };
-		int len = recv_package(client_fd, buf, sizeof(buf));
+		char buf[MAX_PACKET] = { 0 };
+		int len = recv_package(client_fd, buf);
 
 		if (len == 0) {
 			printf("Server closed\n");
@@ -72,8 +96,37 @@ void* handler(void* arg) {
 			printf("package is over size\n");
 			break;
 		}
-		buf[len] = '\0';
-		printf("%s\n", buf);
+
+		//收取到的是读取到的数据类型和数据体，为了方便使用我们直接先计算数据体的长度
+		len -= 1;
+
+		int type = buf[0];
+		if (type == MSG_REGIS) {
+			pthread_mutex_lock(&mutex);
+			status = STA_REGISING;
+			pthread_cond_signal(&cond);
+			pthread_mutex_unlock(&mutex);
+		}
+		//MSG_RECOGISE对客户端至关重要，但是服务器不保证此类消息送达，因为在缓冲区不足时会静默丢包
+		else if (type == MSG_RECOGISE) {
+			pthread_mutex_lock(&mutex);
+			status = STA_RECOGISE;
+			pthread_cond_signal(&cond);
+			pthread_mutex_unlock(&mutex);
+
+			printf("%.*s", len, buf + 1);
+		}
+		else if (type == MSG_NOTICE) {
+			printf("%.*s\n", len, buf + 1);
+		}
+		else if (type == MSG_CHAT) {
+			//[type][name_len][message]
+			uint32_t name_len;
+			memcpy(&name_len, buf + 1, 4);
+			name_len = ntohl(name_len);
+			printf("%.*s:", name_len, buf + 5);
+			printf("%.*s\n", len - name_len - 5, buf + 5 + name_len);
+		}
 	}
 }
 int main() {
@@ -87,27 +140,75 @@ int main() {
 
 	connect(client_fd, (struct sockaddr*)&addr, sizeof(addr));
 
-	char name[32];
-	//printf("Please enter your name:");
-	//fgets(name, sizeof(name), stdin);
-	//name[strcspn(name, "\n")] = '\0';
-	//int s = send_package(client_fd, name);
-	//if (s < 0) {
-	//	perror("Disconnect");
-	//	return 1;
-	//	}
-
 	pthread_t tid;
 	pthread_create(&tid, NULL, &handler, (void*)(intptr_t)client_fd);
 	pthread_detach(tid);
+
+	//客户端在STA_REGISING阶段需要等待一次服务器发消息，只有在接到消息后才能进行下一步操作
+	//在STA_RECOGISE则不需要等待
 	while (1) {
-		char Tell[1020];
-		fgets(Tell, sizeof(Tell), stdin);
-		Tell[strcspn(Tell, "\n")] = '\0';
-		int s = send_package(client_fd, Tell);
-		if (s < 0) {
-			perror("Disconnect");
-			return 1;
+		pthread_mutex_lock(&mutex);
+
+		//不能单独依靠cond来判断状态，必须结合自己的状态
+		while (status == STA_WAIT) {
+			//使用while是因为接收线程可能在主线程运行到这之前就到达，status已经改变
+			pthread_cond_wait(&cond, &mutex);
 		}
+
+		int sta = status;
+
+		if (sta == STA_REGISING) {
+			status = STA_WAIT;
+		}
+
+		pthread_mutex_unlock(&mutex);
+
+		if (sta == STA_REGISING) {
+			char name[33];
+			scanf("%33s", name);
+
+			uint32_t length = htonl(strlen(name));
+			char buf[MAX_PACKET];
+			char* p = buf;
+
+			memcpy(buf, &length, 4);
+			p += 4;
+
+			*p= MSG_REGIS;
+			p += 1;
+
+			memcpy(p, name, strlen(name));
+
+			int w = write_exact(client_fd, buf, 5 + strlen(name));
+			if (w < 0)return 0;
+		}
+		else if (sta == STA_RECOGISE) {
+			char msg[33];
+			scanf("%s", msg);
+
+			uint32_t length = htonl(strlen(msg));
+			char buf[MAX_PACKET];
+			char* p = buf;
+
+			memcpy(p, &length, 4);
+			p += 4;
+
+			*p= MSG_CHAT;
+			p += 1;
+
+			memcpy(p, msg, strlen(msg));
+
+			int w = write_exact(client_fd, buf, 5 + strlen(msg));
+			if (w < 0)return 0;
+		}
+
+		//char Tell[MAX_PACKET - 5];
+		//fgets(Tell, sizeof(Tell), stdin);
+		//Tell[strcspn(Tell, "\n")] = '\0';
+		//int s = send_package(client_fd, Tell);
+		//if (s < 0) {
+		//	perror("Disconnect");
+		//	return 1;
+		//}
 	}
 }
