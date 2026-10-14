@@ -339,7 +339,7 @@ void handler(Conn* conn) {
 	while(conn->rclen >= 5) {		//头完整，再进入数据体判断
 		uint32_t body_len;
 
-		//将rcbuf里取出头4个字节放进net_len
+		//将rcbuf里取出头4个字节放进body_len
 		memcpy(&body_len, conn->rcbuf, 4);
 		body_len = ntohl(body_len);
 
@@ -390,7 +390,7 @@ int packet_dispatch(Conn* conn) {
 	//解析数据体长度
 	uint32_t len;
 	memcpy(&len, conn->rcbuf, sizeof(len));
-	len = htonl(len);
+	len = ntohl(len);
 	//获取数据类型
 	uint8_t type;
 	memcpy(&type, conn->rcbuf + 4, 1);
@@ -418,13 +418,13 @@ int packet_dispatch(Conn* conn) {
 		memcpy(conn->name, conn->rcbuf + 4 + 1, len);
 		conn->name_len = len;
 		conn->status = 2;
-		printf("Client:%d Name:%.*s", conn->fd, len, conn->rcbuf+5);
+		printf("Client:%d Name:%.*s\n", conn->fd, len, conn->rcbuf+5);
 
 		//回应确认登录状态
 		char buf[MAX_NAME + 8];
 		memcpy(buf, "Welcome ", 8);
 		memcpy(buf + 8, conn->name, conn->name_len);
-		notice(conn, MSG_RECOGISE, buf, MAX_NAME + 8);
+		notice(conn, MSG_RECOGISE, buf, conn->name_len + 8);
 		return 1;
 	}
 	else if (type == MSG_CHAT) {
@@ -471,6 +471,7 @@ int packet_dispatch(Conn* conn) {
 		memcpy(p, conn->rcbuf + 5, len);
 		p += len;
 
+		printf("(Client %d)%.*s:%.*s\n", conn->fd, conn->name_len, buf + 9, ntohl(body_len) - 4 - conn->name_len, buf + 4 + 1 + 4 + conn->name_len);
 		broadcast(conn->fd, buf, length);
 
 		return 1;
@@ -484,11 +485,11 @@ int packet_dispatch(Conn* conn) {
 	}
 }
 
-//服务器特供回信
+//服务器特供回信,函数签名为[连接][Type][char*数据][数据长度]，函数内部会根据这些信息自动构成数据包并发送
 //返回1为执行成功，-1为致命失败
 int notice(Conn* conn, uint8_t type, const char* buf, int Len){
 	//检查
-	if (Len + 5 > SDBUF_SIZE - conn->sdlen) {
+	if (Len > SDBUF_SIZE - conn->sdlen - 5) {
 		printf("Unable to notice: conn's send space no enough\n");
 		return 1;//这里的1不代表完成任务，只代表运行正常，但确实是无法达到结果
 	}

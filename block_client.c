@@ -78,6 +78,7 @@ int recv_package(int fd, char* buf) {
 	return r;
 }
 
+//收到的buf是这样的[Type][msg],不包含Header，Header[body_len][Type]是recv_package的返回值
 void* handler(void* arg) {
 	int client_fd = (int)(intptr_t)arg;
 	while (1) {
@@ -104,6 +105,7 @@ void* handler(void* arg) {
 		if (type == MSG_REGIS) {
 			pthread_mutex_lock(&mutex);
 			status = STA_REGISING;
+			printf("%.*s\n", len, buf + 1);
 			pthread_cond_signal(&cond);
 			pthread_mutex_unlock(&mutex);
 		}
@@ -114,18 +116,18 @@ void* handler(void* arg) {
 			pthread_cond_signal(&cond);
 			pthread_mutex_unlock(&mutex);
 
-			printf("%.*s", len, buf + 1);
+			printf("%.*s\n", len, buf + 1);
 		}
 		else if (type == MSG_NOTICE) {
 			printf("%.*s\n", len, buf + 1);
 		}
 		else if (type == MSG_CHAT) {
-			//[type][name_len][message]
+			//[type][name_len][name][message]
 			uint32_t name_len;
 			memcpy(&name_len, buf + 1, 4);
 			name_len = ntohl(name_len);
 			printf("%.*s:", name_len, buf + 5);
-			printf("%.*s\n", len - name_len - 5, buf + 5 + name_len);
+			printf("%.*s\n", len - name_len - 4, buf + 5 + name_len);
 		}
 	}
 }
@@ -180,11 +182,15 @@ int main() {
 			memcpy(p, name, strlen(name));
 
 			int w = write_exact(client_fd, buf, 5 + strlen(name));
-			if (w < 0)return 0;
+			if (w < 0) {
+				perror("Disconnect");
+				return 1;
+			}
 		}
 		else if (sta == STA_RECOGISE) {
 			char msg[33];
-			scanf("%s", msg);
+			fgets(msg, sizeof(msg), stdin);
+			msg[strcspn(msg, "\n")] = '\0';
 
 			uint32_t length = htonl(strlen(msg));
 			char buf[MAX_PACKET];
@@ -199,11 +205,14 @@ int main() {
 			memcpy(p, msg, strlen(msg));
 
 			int w = write_exact(client_fd, buf, 5 + strlen(msg));
-			if (w < 0)return 0;
+			if (w < 0) {
+				perror("Disconnect");
+				return 1;
+			}
 		}
 
 		//char Tell[MAX_PACKET - 5];
-		//fgets(Tell, sizeof(Tell), stdin);
+		//
 		//Tell[strcspn(Tell, "\n")] = '\0';
 		//int s = send_package(client_fd, Tell);
 		//if (s < 0) {
