@@ -8,6 +8,16 @@
 #include<pthread.h>
 #include<signal.h>
 
+/*
+客户端行为准则：
+1.刚建立TCP连接	等待服务器响应消息
+2.收到REGIS	填写注册消息，发送数据包，等待回应
+3.收到notice	播报notice
+4.收到recogis	可以进入发送消息
+5.收到chat		播报chat
+6.在2之后又收到regis（这里不区分是否收到notice，这是错误情况重试要求）		填写注册消息，发送数据包，等待回应
+*/
+
 #define MSG_REGIS 0
 #define MSG_LOGIN 1
 #define MSG_LOGOUT 2
@@ -22,7 +32,12 @@
 #define STA_RECOGISE 2
 #define STA_CLOSE -1
 
+#define REQ_NONE -1
+#define REQ_RECOGISE 0
+#define REQ_REGIS 1
+
 int status = STA_WAIT;
+int request = REQ_NONE;
 
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -104,7 +119,8 @@ void* handler(void* arg) {
 		int type = buf[0];
 		if (type == MSG_REGIS) {
 			pthread_mutex_lock(&mutex);
-			status = STA_REGISING;
+
+			request=REQ_REGIS;
 			printf("%.*s\n", len, buf + 1);
 			pthread_cond_signal(&cond);
 			pthread_mutex_unlock(&mutex);
@@ -112,7 +128,7 @@ void* handler(void* arg) {
 		//MSG_RECOGISE对客户端至关重要，但是服务器不保证此类消息送达，因为在缓冲区不足时会静默丢包
 		else if (type == MSG_RECOGISE) {
 			pthread_mutex_lock(&mutex);
-			status = STA_RECOGISE;
+			request = REQ_RECOGISE;
 			pthread_cond_signal(&cond);
 			pthread_mutex_unlock(&mutex);
 
@@ -131,6 +147,40 @@ void* handler(void* arg) {
 		}
 	}
 }
+
+int regis(int client_fd) {
+	char name[33];
+	scanf("%32s", name);
+
+	uint32_t length = htonl(strlen(name));
+	char buf[MAX_PACKET];
+	char* p = buf;
+
+	memcpy(buf, &length, 4);
+	p += 4;
+
+	*p = MSG_REGIS;
+	p += 1;
+
+	memcpy(p, name, strlen(name));
+
+	int w = write_exact(client_fd, buf, 5 + strlen(name));
+	if (w < 0) {
+		perror("Disconnect");
+		return -1;
+	}
+	return 1;
+}
+
+//当前的运行机制：
+//接收线程收到消息，根据消息有两种执行
+//1.打印任务，直接执行
+//2.请求任务，通过request与主线程交流
+//主线程收到request后，根据数值，判断其任务类型
+//1.一次性任务，直接调用模块执行
+//2.长期任务，修改status，后续业务根据status运行
+//其实也就两种工作，request->status->work && request->work
+
 int main() {
 	signal(SIGPIPE, SIG_IGN);
 
@@ -148,46 +198,34 @@ int main() {
 
 	//客户端在STA_REGISING阶段需要等待一次服务器发消息，只有在接到消息后才能进行下一步操作
 	//在STA_RECOGISE则不需要等待
-	while (1) {
-		pthread_mutex_lock(&mutex);
+	while (status!=STA_CLOSE) {
+		if (status == STA_WAIT) {
+			int req;
+			pthread_mutex_lock(&mutex);
 
-		//不能单独依靠cond来判断状态，必须结合自己的状态
-		while (status == STA_WAIT) {
-			//使用while是因为接收线程可能在主线程运行到这之前就到达，status已经改变
-			pthread_cond_wait(&cond, &mutex);
-		}
+			//不能单独依靠cond来判断状态，必须结合自己的状态
+			while (request == REQ_NONE) {
+				pthread_cond_wait(&cond, &mutex);
+			}
 
-		int sta = status;
+			req = request;
+			request = REQ_NONE;
+			
+			pthread_mutex_unlock(&mutex);
 
-		if (sta == STA_REGISING) {
-			status = STA_WAIT;
-		}
-
-		pthread_mutex_unlock(&mutex);
-
-		if (sta == STA_REGISING) {
-			char name[33];
-			scanf("%33s", name);
-
-			uint32_t length = htonl(strlen(name));
-			char buf[MAX_PACKET];
-			char* p = buf;
-
-			memcpy(buf, &length, 4);
-			p += 4;
-
-			*p= MSG_REGIS;
-			p += 1;
-
-			memcpy(p, name, strlen(name));
-
-			int w = write_exact(client_fd, buf, 5 + strlen(name));
-			if (w < 0) {
-				perror("Disconnect");
-				return 1;
+			if (req == REQ_REGIS) {
+				int x = regis(client_fd);
+				if (x == -1) {
+					status = STA_CLOSE;
+					break;
+				}
+			}
+			else if (req == REQ_RECOGISE) {
+				status = STA_RECOGISE;
 			}
 		}
-		else if (sta == STA_RECOGISE) {
+
+		while (status == STA_RECOGISE) {
 			char msg[33];
 			fgets(msg, sizeof(msg), stdin);
 			msg[strcspn(msg, "\n")] = '\0';
@@ -206,8 +244,8 @@ int main() {
 
 			int w = write_exact(client_fd, buf, 5 + strlen(msg));
 			if (w < 0) {
-				perror("Disconnect");
-				return 1;
+				status = STA_CLOSE;
+				break;
 			}
 		}
 
