@@ -226,7 +226,7 @@ int main() {
 		}
 
 		while (status == STA_RECOGISE) {
-			char msg[33];
+			char msg[900];
 			fgets(msg, sizeof(msg), stdin);
 			msg[strcspn(msg, "\n")] = '\0';
 

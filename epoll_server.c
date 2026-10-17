@@ -10,6 +10,7 @@
 #include<stdlib.h>
 #include<signal.h>
 #include<stdint.h>
+#include "log.h"
 /*
 协议定义：
 
@@ -55,14 +56,14 @@
 #define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
 #define MAX_NAME 32		//最长名字
 
-int epfd;
-
 #define MSG_REGIS 0
 #define MSG_LOGIN 1
 #define MSG_LOGOUT 2
 #define MSG_CHAT 3
 #define MSG_NOTICE 4
 #define MSG_RECOGISE 5
+
+int epfd;
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
@@ -109,8 +110,8 @@ Conn* conn_insert(int fd) {
 			conns[i].fd = fd;
 			conns[i].rclen = 0;
 			conns[i].sdlen = 0;
-			memcpy(conns[i].name, "unknow", 6);
-			conns[i].name_len = 0;
+			memcpy(conns[i].name, "unknown", 7);
+			conns[i].name_len = 7;
 			conns[i].status = 1;
 			return &conns[i];
 		}
@@ -128,7 +129,7 @@ void report(Conn* conn) {
 		//该链接是否为空位
 		if (fail_list[i] == NULL){
 			fail_list[i] = conn;
-			printf("Client:%d %.*s has been push into fail_list\n", conn->fd, conn->name_len, conn->name);
+			LOG(LOG_DEBUG, conn->fd, "Client:%.*s has been push into fail_list", conn->name_len, conn->name);
 			break;
 		}
 	}
@@ -137,20 +138,20 @@ void report(Conn* conn) {
 //清理
 void clean(Conn* conn) {
 	if (conn->fd == -1) {
-		printf("Can't close fd:-1\n");
+		LOG(LOG_INFO, conn->fd, "Can't close fd:-1");
 		return;
 	}
 	//先除名，再关闭，防止fd被复用但又被除名
+	LOG(LOG_INFO, conn->fd, "Client: Name:%.*s disconnect,status %d -> 0", conn->name_len, conn->name,conn->status);
 	epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
 	int fd = conn->fd;
 	conn->fd = -1;
 	conn->rclen = 0;
 	conn->sdlen = 0;
 	conn->status = 0;
-	memcpy(conn->name, "unknow", 6);
-	conn->name_len = 0;
+	memcpy(conn->name, "unknown", 7);
+	conn->name_len = 7;
 	close(fd);
-	printf("Client:%d disconnect\n", fd);
 }
 //返回值为-1的情况代表错误和客户端关闭，这两种都需要进行处理，所以被归为一类
 //正常情况返回值为got
@@ -206,7 +207,7 @@ void msg_cpy(char*buf, int length, Conn* conn) {
 	//如果连接的用户态缓冲区不足，就直接放弃这个包,执行静默丢包
 	//不可以说能塞多少塞多少，这会导致没塞下的包被丢失后，客户端协议永远没办法解析完整这个包，实际上导致解析错乱，把别的数据包的消息头拿去解析了
 	if (SDBUF_SIZE - conn->sdlen < length) {
-		printf("Client:%d %.*s space no enough,drop packet\n", conn->fd, conn->name_len, conn->name);
+		LOG(LOG_WARN,conn->fd,"Client:%.*s space no enough,drop packet", conn->name_len, conn->name);
 		return;
 	}
 
@@ -292,6 +293,7 @@ int flush(Conn* conn) {
 	//返回1代表正常
 	return 1;
 }
+
 //广播
 //遍历整个conns列表，如果不是空的，也不是消息发送者本人，就进行发送，用flush能更好的发送（使用send清理sdbuf，还可以进行状态注册）
 void broadcast(int fd,char*buf,int length){
@@ -327,11 +329,13 @@ void handler(Conn* conn) {
 
 	int n = recv_clear(conn);
 	if (n == -1) {		//连接失败
+		LOG(LOG_ERROR, conn->fd, "Client:%.*s connection error,status %d -> -1", conn->name_len, conn->name, conn->status);
 		conn->status = -1;
 		report(conn);
 		return;
 	}
 	else if (n == -2) {		//连接关闭
+		LOG(LOG_INFO, conn->fd, "Client:%.*s disconnect,status %d -> 0",conn->name_len, conn->name, conn->status);
 		conn->status = 0;
 		report(conn);
 		return;
@@ -346,8 +350,9 @@ void handler(Conn* conn) {
 		//非法大包，直接关闭违规客户端
 		if (body_len > MAX_PACKET - 5) {
 			char* buf = "Your package is over size";
+			//可不检测notice是否产生致命错误，因为最后都要关闭连接
 			notice(conn, MSG_NOTICE, buf, strlen(buf));
-			printf("Invalid package!\n");
+			LOG(LOG_INFO, conn->fd, "Client:%.*s Invalid package, status %d -> -1", conn->name_len, conn->name, conn->status);
 			conn->status = -1;
 			report(conn);
 			break;
@@ -357,6 +362,7 @@ void handler(Conn* conn) {
 		if (body_len == 0) {
 			conn->rclen -= 5;
 			memmove(conn->rcbuf, conn->rcbuf + 5, conn->rclen);
+			LOG(LOG_INFO, conn->fd, "Client:%.*s Empty packet", conn->name_len, conn->name);
 			continue;
 		}
 
@@ -367,6 +373,7 @@ void handler(Conn* conn) {
 			//一种是致命失败，致命失败是需要直接进入清理程序的
 			if (X == -1) {
 				//致命失败，直接关闭链接
+				LOG(LOG_ERROR, conn->fd, "Client:%.*s fail,status %d -> -1", conn->name_len, conn->name, conn->status);
 				conn->status = -1;
 				report(conn);
 				break;
@@ -403,6 +410,7 @@ int packet_dispatch(Conn* conn) {
 			char* buf1 = "Your name is invalid,try again";
 			int X = notice(conn, MSG_NOTICE, buf1,strlen(buf1));
 			if (X == -1) {
+				LOG(LOG_ERROR, conn->fd, "Notice error");
 				return -1;
 			}
 
@@ -410,6 +418,7 @@ int packet_dispatch(Conn* conn) {
 			char* buf2 = "Please enter your name:";
 			X = notice(conn, MSG_REGIS, buf2,strlen(buf2));
 			if (X == -1) {
+				LOG(LOG_ERROR, conn->fd, "Notice error");
 				return -1;
 			}
 			return 1;
@@ -417,8 +426,9 @@ int packet_dispatch(Conn* conn) {
 		//[len][MSG_REGIS][NAME]
 		memcpy(conn->name, conn->rcbuf + 4 + 1, len);
 		conn->name_len = len;
+		LOG(LOG_DEBUG, conn->fd, "Client regis name:%.*s,status %d -> 2", len, conn->rcbuf + 5, conn->status);
 		conn->status = 2;
-		printf("Client:%d Name:%.*s\n", conn->fd, len, conn->rcbuf+5);
+		
 
 		//回应确认登录状态
 		char buf[MAX_NAME + 8];
@@ -471,7 +481,7 @@ int packet_dispatch(Conn* conn) {
 		memcpy(p, conn->rcbuf + 5, len);
 		p += len;
 
-		printf("(Client %d)%.*s:%.*s\n", conn->fd, conn->name_len, buf + 9, ntohl(body_len) - 4 - conn->name_len, buf + 4 + 1 + 4 + conn->name_len);
+		LOG(LOG_DEBUG,conn->fd,"%.*s:%.*s", conn->name_len, buf + 9, ntohl(body_len) - 4 - conn->name_len, buf + 4 + 1 + 4 + conn->name_len);
 		broadcast(conn->fd, buf, length);
 
 		return 1;
@@ -480,6 +490,7 @@ int packet_dispatch(Conn* conn) {
 	else {
 		char* buf = "Your packet is unclear";
 		notice(conn, MSG_NOTICE, buf,strlen(buf));
+		LOG(LOG_WARN, conn->fd, "Client:%.*s Unknown packet type",conn->name_len,conn->name);
 		//无论如何都要clean，notice返回值可以不必检查
 		return -1;
 	}
@@ -490,7 +501,7 @@ int packet_dispatch(Conn* conn) {
 int notice(Conn* conn, uint8_t type, const char* buf, int Len){
 	//检查
 	if (Len > SDBUF_SIZE - conn->sdlen - 5) {
-		printf("Unable to notice: conn's send space no enough\n");
+		LOG(LOG_WARN, conn->fd, "Unable to notice: conn's send space no enough");
 		return 1;//这里的1不代表完成任务，只代表运行正常，但确实是无法达到结果
 	}
 
@@ -520,7 +531,7 @@ void accept_client(Conn* conn) {
 	while (1) {
 		int client_fd = accept(conn->fd, NULL, NULL);
 		if (client_fd < 0) {
-			//没有新连接
+			//所有连接都已经连接了，缓冲区为空，触发EAGAIM或EWOULDBLOCK
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				break;
 			}
@@ -529,6 +540,7 @@ void accept_client(Conn* conn) {
 				continue;
 			}
 			perror("accept");
+			LOG(LOG_ERROR, client_fd, "accept error");
 			break;
 		}
 
@@ -536,7 +548,7 @@ void accept_client(Conn* conn) {
 		Conn* new_conn = conn_insert(client_fd);
 		//如果连接的客户端满了，直接放弃剩下想要连接的客户端
 		if (new_conn == NULL) {
-			printf("Connection is full\n");
+			LOG(LOG_WARN, client_fd, "Connection is full,drop connection");
 			close(client_fd);
 			break;
 		}
@@ -551,12 +563,13 @@ void accept_client(Conn* conn) {
 		epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
 
 		//新连接就绪
-		printf("Client:%d connected\n", client_fd);
+		LOG(LOG_INFO, client_fd, "Client:%d connected,status 0 -> %d", client_fd, new_conn -> status);
 
 		//特供回信:要求注册
 		char* buf = "Please enter your name:";
 		int X = notice(new_conn, MSG_REGIS, buf,strlen(buf));
 		if (X == -1) {
+			LOG(LOG_ERROR, new_conn->fd, "Unable to notice,status %d -> -1",new_conn->status);
 			new_conn->status = -1;
 			report(new_conn);
 		}
@@ -566,6 +579,9 @@ void accept_client(Conn* conn) {
 int main() {
 	//遇到信号EPIPE就忽略
 	signal(SIGPIPE, SIG_IGN);
+
+	//设置日志等级
+	log_set_level(LOG_DEBUG);
 
 	//创建服务器文件描述符，IPV4,TCP协议
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -580,16 +596,19 @@ int main() {
 	int opt = 1;
 	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
 		perror("setsockopt");
+		LOG(LOG_ERROR, server_fd, "setsockopt error");
 	}
 
 	//绑定IP与服务器接口
 	if ((bind(server_fd, (struct sockaddr*)&addr, sizeof(addr))) < 0) {
 		perror("bind");
+		LOG(LOG_ERROR, server_fd, "bind error");
 		return 1;
 	}
 	//建立监听，accept等待队列128
 	if ((listen(server_fd, 128)) < 0) {
 		perror("listen");
+		LOG(LOG_ERROR, server_fd, "listen error");
 		return 1;
 	}
 
@@ -631,12 +650,14 @@ int main() {
 	//创建事件列表
 	struct epoll_event events[MAX_EVENTS];
  
-	printf("Server Online\n");
+	LOG(LOG_INFO, server_fd, "Server Online");
+
 	while (1) {
 		int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
 		if (n < 0) {
 			if (errno == EINTR)continue;
 			perror("epoll_wait");
+			LOG(LOG_ERROR, server_fd, "epoll_wait error");
 			continue;
 		}
 		for (int i = 0; i < n; i++) {
@@ -647,8 +668,9 @@ int main() {
 			}
 			//已连接客户端请求
 			else {
-				int e = events[i].events;
 				if (conn->fd == -1)continue;
+
+				int e = events[i].events;
 				//对端异常关闭
 				if (e & (EPOLLERR | EPOLLHUP)) {
 					//获取异常socket属性
@@ -656,17 +678,18 @@ int main() {
 					socklen_t elen = sizeof(err);
 					getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
 
-					printf("Client %d %s\n", conn->fd, err ? strerror(err) : "hang up");
+					LOG(LOG_ERROR, conn->fd, "Client %d %s,status to -1", conn->fd, err ? strerror(err) : "hang up");
 					conn->status = -1;
 					report(conn);
 				}
 				//客户端发送消息
-				if (e & EPOLLIN && conn->fd!=-1)handler(conn);
+				if (e & EPOLLIN && conn->fd != -1)handler(conn);
 
 				//向客户端发送消息
 				if (e & EPOLLOUT && conn->fd != -1) {
 					int x = flush(conn);
 					if (x == -1) {
+						LOG(LOG_ERROR, conn->fd, "Unable to flush,status %d -> -1",conn->status);
 						conn->status = -1;
 						report(conn);
 					}
@@ -676,6 +699,7 @@ int main() {
 				//必须要添加非EPOLLIN情况判断，客户端发送Fin后系统会立刻上报EPOLLIN|EPOLLRDHUP
 				//如果内核缓冲区的数据还没被读取完，而我们直接通过EPOLLRDHUP关闭链接，会导致内核缓冲区的数据丢失
 				if (e & EPOLLRDHUP && conn->fd != -1 && !(e & EPOLLIN )) {
+					LOG(LOG_INFO, conn->fd, "Client:Name:%.*s disconnect,status %d -> 0", conn->name_len, conn->name, conn->status);
 					conn->status = 0;
 					report(conn);
 				}
@@ -691,17 +715,17 @@ int main() {
 		}
 	}
 	//暂未设定如何关闭服务器
-	printf("Server offline\n");
+	LOG(LOG_INFO, server_fd, "Server offline\n");
 	close(server_fd);
 	return 0;
 }
 
 //计划
 
-// 统一故障链接处理机制，保证链接生命周期的确定性，增加处决队列，举报机制，不再在非当前事件响应时直接清理故障链接，而是统一事件响应轮结束时 
-
 // 改进发送缓冲区不足时的处理机制，不应该再默认丢包
 // 此改进可以解决notice不保证送达的问题，更从根源上解决此类“目的不一定达成，运行一定完成”的问题
+
+//完善状态机，补充类型，宏定义，状态机机制为状态检测判别连接的权限范围，而不直接根据状态执行业务
 
 // 增加半包链接的心跳程序
  
