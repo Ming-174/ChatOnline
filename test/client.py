@@ -5,6 +5,15 @@ import threading
 HOST = "127.0.0.1"
 PORT = 8888
 
+MSG_REGIS = 0
+MSG_CHAT = 3
+MSG_NOTICE = 4
+MSG_RECOGISE = 5
+
+STA_UNREADY 0
+STA_READY 1
+STA_CLOSE 2
+
 def recv_exact(sock,size):
     #创建bytes变量
     data=b""
@@ -20,17 +29,19 @@ def recv_exact(sock,size):
 
     return data
 
+#固定读取4字节头后，读取1字节type，再按照4字节头给的长度读取payload，最后返回type和未解析的payload
 def recv_pack(sock):
     #接收消息头
     header=recv_exact(sock,4)
     #消息头从网络字节序转为主机字节序
     length=struct.unpack("!I",header)[0]
+    #接收类型Type
+    Type=recv_exact(sock,1)
+    Type=struct.unpack("!B",Type)[0]
     #接收消息体
     data=recv_exact(sock,length)
-    #utf-8转为python文本
-    data=data.decode("utf-8")
-
-    return data
+    
+    return Type,data
 
 def send_package(sock,msg):
     #python文本转utf-8
@@ -43,8 +54,12 @@ def send_package(sock,msg):
 def work(sock):
     try:
         while True:
-            data=recv_pack(sock)
-            print(data)
+            Type,data=recv_pack(sock)
+            if Type==MSG_REGIS:
+                data.decode('utf-8')
+                print(data)
+                
+
     except(ConnectionError,OSError):
         print("Thread close")
 

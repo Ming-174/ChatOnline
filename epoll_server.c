@@ -65,6 +65,11 @@
 
 int epfd;
 
+#define STA_ERROR -1
+#define STA_DISCONNECT 0
+#define STA_UNREADY 1
+#define STA_READY 2
+
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
 	int fd;
@@ -112,7 +117,7 @@ Conn* conn_insert(int fd) {
 			conns[i].sdlen = 0;
 			memcpy(conns[i].name, "unknown", 7);
 			conns[i].name_len = 7;
-			conns[i].status = 1;
+			conns[i].status = STA_UNREADY;
 			return &conns[i];
 		}
 	}
@@ -142,13 +147,13 @@ void clean(Conn* conn) {
 		return;
 	}
 	//先除名，再关闭，防止fd被复用但又被除名
-	LOG(LOG_INFO, conn->fd, "Client: Name:%.*s disconnect,status %d -> 0", conn->name_len, conn->name,conn->status);
+	LOG(LOG_INFO, conn->fd, "Client:%.*s disconnect,status %d -> STA_DISCONNECT", conn->name_len, conn->name,conn->status);
 	epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
 	int fd = conn->fd;
 	conn->fd = -1;
 	conn->rclen = 0;
 	conn->sdlen = 0;
-	conn->status = 0;
+	conn->status = STA_DISCONNECT;
 	memcpy(conn->name, "unknown", 7);
 	conn->name_len = 7;
 	close(fd);
@@ -268,7 +273,7 @@ int send_clear(Conn* conn) {
 int flush(Conn* conn) {
 	//返回-1代表这个链接已经关闭，不可再用，上级程序应该采取其他操作
 	if (conn->fd == -1)return -1;
-	if (conn->status == -1 || conn->status == 0)return -1;
+	if (conn->status == STA_ERROR || conn->status == STA_DISCONNECT)return -1;
 	int sd = send_clear(conn);
 	if (sd < 0) {
 		perror("send");
@@ -299,13 +304,13 @@ int flush(Conn* conn) {
 void broadcast(int fd,char*buf,int length){
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		//检查链接状态
-		if (conns[i].status == 2) {
+		if (conns[i].status == STA_READY) {
 			//检查槽位是否有链接
 			if (conns[i].fd != -1 && conns[i].fd != fd) {
 				msg_cpy(buf, length, &conns[i]);
 				int n = flush(&conns[i]);
 				if (n == -1) {
-					conns[i].status = -1;
+					conns[i].status = STA_ERROR;
 					report(&conns[i]);
 				}
 			}
@@ -323,20 +328,20 @@ void broadcast(int fd,char*buf,int length){
 //注：部分由服务器构造的数据包会直发至客户端，不经过handler，这类数据包通常不需要通过消费来进行对内存空间的调整
 void handler(Conn* conn) {
 	//检查当前链接状态
-	if (conn->status == -1 || conn->status == 0) {
+	if (conn->status == STA_ERROR || conn->status == STA_DISCONNECT) {
 		return;
 	}
 
 	int n = recv_clear(conn);
 	if (n == -1) {		//连接失败
-		LOG(LOG_ERROR, conn->fd, "Client:%.*s connection error,status %d -> -1", conn->name_len, conn->name, conn->status);
-		conn->status = -1;
+		LOG(LOG_ERROR, conn->fd, "Client:%.*s connection error,status %d -> STA_ERROR", conn->name_len, conn->name, conn->status);
+		conn->status = STA_ERROR;
 		report(conn);
 		return;
 	}
 	else if (n == -2) {		//连接关闭
-		LOG(LOG_INFO, conn->fd, "Client:%.*s disconnect,status %d -> 0",conn->name_len, conn->name, conn->status);
-		conn->status = 0;
+		LOG(LOG_INFO, conn->fd, "Client:%.*s disconnect,status %d -> STA_DISCONNECT",conn->name_len, conn->name, conn->status);
+		conn->status = STA_DISCONNECT;
 		report(conn);
 		return;
 	}
@@ -352,8 +357,8 @@ void handler(Conn* conn) {
 			char* buf = "Your package is over size";
 			//可不检测notice是否产生致命错误，因为最后都要关闭连接
 			notice(conn, MSG_NOTICE, buf, strlen(buf));
-			LOG(LOG_INFO, conn->fd, "Client:%.*s Invalid package, status %d -> -1", conn->name_len, conn->name, conn->status);
-			conn->status = -1;
+			LOG(LOG_INFO, conn->fd, "Client:%.*s Invalid package, status %d -> STA_ERROR", conn->name_len, conn->name, conn->status);
+			conn->status = STA_ERROR;
 			report(conn);
 			break;
 		}
@@ -373,8 +378,8 @@ void handler(Conn* conn) {
 			//一种是致命失败，致命失败是需要直接进入清理程序的
 			if (X == -1) {
 				//致命失败，直接关闭链接
-				LOG(LOG_ERROR, conn->fd, "Client:%.*s fail,status %d -> -1", conn->name_len, conn->name, conn->status);
-				conn->status = -1;
+				LOG(LOG_ERROR, conn->fd, "Client:%.*s fail,status %d -> STA_ERROR", conn->name_len, conn->name, conn->status);
+				conn->status = STA_ERROR;
 				report(conn);
 				break;
 			}
@@ -403,6 +408,10 @@ int packet_dispatch(Conn* conn) {
 	memcpy(&type, conn->rcbuf + 4, 1);
 	//分拣
 	if (type == MSG_REGIS) {
+		if (conn->status != STA_UNREADY) {//状态不符合消息管制，拒收丢弃
+			LOG(LOG_INFO, conn->fd, "Client:%.*s send a packet out of status ,current status:%d ,drop the packet", conn->name_len, conn->name, conn->status);
+			return 1;
+		}
 		//检查名字是否合规
 		if (len > 32) {
 
@@ -426,8 +435,8 @@ int packet_dispatch(Conn* conn) {
 		//[len][MSG_REGIS][NAME]
 		memcpy(conn->name, conn->rcbuf + 4 + 1, len);
 		conn->name_len = len;
-		LOG(LOG_DEBUG, conn->fd, "Client regis name:%.*s,status %d -> 2", len, conn->rcbuf + 5, conn->status);
-		conn->status = 2;
+		LOG(LOG_DEBUG, conn->fd, "Client regis name:%.*s,status %d -> STA_READY", len, conn->rcbuf + 5, conn->status);
+		conn->status = STA_READY;
 		
 
 		//回应确认登录状态
@@ -438,11 +447,15 @@ int packet_dispatch(Conn* conn) {
 		return 1;
 	}
 	else if (type == MSG_CHAT) {
+		if (conn->status != STA_READY) {//状态不符合消息管制，拒收丢弃
+			LOG(LOG_INFO, conn->fd, "Client:%.*s send a packet out of status ,current status:%d ,drop the packet", conn->name_len, conn->name, conn->status);
+			return 1;
+		}
 		//[len1][type][msg] --> [len2][type][name_len][name][msg]
 		//length数据包全长 body_len拼装后数据体长度 len原数据包数据体长度
 		
 		//若为未注册，则不可发送消息，且消息要被消费
-		if (conn->status != 2) {
+		if (conn->status != STA_READY) {
 			return 1;
 		}
 
@@ -563,13 +576,13 @@ void accept_client(Conn* conn) {
 		epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cli);
 
 		//新连接就绪
-		LOG(LOG_INFO, client_fd, "Client:%d connected,status 0 -> %d", client_fd, new_conn -> status);
+		LOG(LOG_INFO, client_fd, "Client:%d connected,status STA_DISCONNECT -> %d", client_fd, new_conn -> status);
 
 		//特供回信:要求注册
 		char* buf = "Please enter your name:";
 		int X = notice(new_conn, MSG_REGIS, buf,strlen(buf));
 		if (X == -1) {
-			LOG(LOG_ERROR, new_conn->fd, "Unable to notice,status %d -> -1",new_conn->status);
+			LOG(LOG_ERROR, new_conn->fd, "Unable to notice,status %d -> STA_ERROR",new_conn->status);
 			new_conn->status = -1;
 			report(new_conn);
 		}
@@ -617,7 +630,7 @@ int main() {
 		conns[i].fd = -1;
 		conns[i].sdlen = 0;
 		conns[i].rclen = 0;
-		conns[i].status = 0;
+		conns[i].status = STA_DISCONNECT;
 	}
 
 	for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -632,7 +645,7 @@ int main() {
 	server_conn.fd = server_fd;
 	server_conn.rclen = 0;
 	server_conn.sdlen = 0;
-	server_conn.status = 0;
+	server_conn.status = STA_DISCONNECT;
 
 	//epoll TL建立
 	epfd = epoll_create(1);
@@ -678,8 +691,8 @@ int main() {
 					socklen_t elen = sizeof(err);
 					getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
 
-					LOG(LOG_ERROR, conn->fd, "Client %d %s,status to -1", conn->fd, err ? strerror(err) : "hang up");
-					conn->status = -1;
+					LOG(LOG_ERROR, conn->fd, "Client %d %s,status to STA_ERROR", conn->fd, err ? strerror(err) : "hang up");
+					conn->status = STA_ERROR;
 					report(conn);
 				}
 				//客户端发送消息
@@ -689,8 +702,8 @@ int main() {
 				if (e & EPOLLOUT && conn->fd != -1) {
 					int x = flush(conn);
 					if (x == -1) {
-						LOG(LOG_ERROR, conn->fd, "Unable to flush,status %d -> -1",conn->status);
-						conn->status = -1;
+						LOG(LOG_ERROR, conn->fd, "Unable to flush,status %d -> STA_ERROR",conn->status);
+						conn->status = STA_ERROR;
 						report(conn);
 					}
 				}
@@ -699,8 +712,8 @@ int main() {
 				//必须要添加非EPOLLIN情况判断，客户端发送Fin后系统会立刻上报EPOLLIN|EPOLLRDHUP
 				//如果内核缓冲区的数据还没被读取完，而我们直接通过EPOLLRDHUP关闭链接，会导致内核缓冲区的数据丢失
 				if (e & EPOLLRDHUP && conn->fd != -1 && !(e & EPOLLIN )) {
-					LOG(LOG_INFO, conn->fd, "Client:Name:%.*s disconnect,status %d -> 0", conn->name_len, conn->name, conn->status);
-					conn->status = 0;
+					LOG(LOG_INFO, conn->fd, "Client:Name:%.*s disconnect,status %d -> STA_DISCONNECT", conn->name_len, conn->name, conn->status);
+					conn->status = STA_DISCONNECT;
 					report(conn);
 				}
 			}

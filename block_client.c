@@ -18,6 +18,21 @@
 6.在2之后又收到regis（这里不区分是否收到notice，这是错误情况重试要求）		填写注册消息，发送数据包，等待回应
 */
 
+/* 业务状态机
+
+刚建立TCP连接时，状态为unready
+等待接受服务器响应
+收到事件regis后，填写发送注册消息
+收到事件recogise后，状态转入ready
+收到chat事件，不响应（这部分先不做
+
+ready状态下，可发送chat消息
+注意，虽然模式是 事件触发行为，状态辅助判断行为选择并限制行为，但是发送聊天消息这种事情是没有事件触发的，唯一的限制是当前客户端是否被服务器认可
+
+在服务器不可用后，进入close
+行为：播报消息，等待用户关闭客户端
+*/
+
 #define MSG_REGIS 0
 #define MSG_LOGIN 1
 #define MSG_LOGOUT 2
@@ -27,16 +42,15 @@
 
 #define MAX_PACKET 1024
 
-#define STA_WAIT 0
-#define STA_REGISING 1
-#define STA_RECOGISE 2
+#define STA_UNREADY 0
+#define STA_READY 1
 #define STA_CLOSE -1
 
 #define REQ_NONE -1
 #define REQ_RECOGISE 0
 #define REQ_REGIS 1
 
-int status = STA_WAIT;
+int status = STA_UNREADY;
 int request = REQ_NONE;
 
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -196,10 +210,9 @@ int main() {
 	pthread_create(&tid, NULL, &handler, (void*)(intptr_t)client_fd);
 	pthread_detach(tid);
 
-	//客户端在STA_REGISING阶段需要等待一次服务器发消息，只有在接到消息后才能进行下一步操作
-	//在STA_RECOGISE则不需要等待
+	//流程：接收线程不断接收数据包，把事件传递给主线程，主线程根据事件和状态决定行为
 	while (status!=STA_CLOSE) {
-		if (status == STA_WAIT) {
+		while (status == STA_UNREADY) {
 			int req;
 			pthread_mutex_lock(&mutex);
 
@@ -210,9 +223,11 @@ int main() {
 
 			req = request;
 			request = REQ_NONE;
-			
-			pthread_mutex_unlock(&mutex);
 
+			pthread_mutex_unlock(&mutex);
+			//接收完毕，进行行为判断
+
+			//如果事件是regis，就填报发送消息
 			if (req == REQ_REGIS) {
 				int x = regis(client_fd);
 				if (x == -1) {
@@ -221,11 +236,12 @@ int main() {
 				}
 			}
 			else if (req == REQ_RECOGISE) {
-				status = STA_RECOGISE;
+				status = STA_READY;
 			}
 		}
-
-		while (status == STA_RECOGISE) {
+		
+		//这里不用while用if，是确保上面的事件接听事件能运行，虽然不优雅，但就先这样吧
+		while (status == STA_READY) {
 			char msg[900];
 			fgets(msg, sizeof(msg), stdin);
 			msg[strcspn(msg, "\n")] = '\0';

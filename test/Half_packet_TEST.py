@@ -7,6 +7,11 @@ from time import sleep
 HOST="127.0.0.1"
 PORT=8888
 
+MSG_REGIS    0
+MSG_CHAT     3
+MSG_NOTICE   4
+MSG_RECOGISE 5
+
 def send_pack(sock,msg):
     body=msg.encode("utf-8")
     header=struct.pack("!I",len(body))
