@@ -15,9 +15,10 @@ int epfd;
 int client_fd;
 
 #define STA_CLOSE -1
-#define STA_UNCONNECT 0
-#define STA_UNREADY 1
-#define STA_READY 2
+#define STA_CONNECT 0
+#define STA_UNCONNECT 1
+#define STA_UNREADY 2
+#define STA_READY 3
 
 #define MAX_EVENTS 128	//最大同时处理响应链接数
 #define MAX_CLIENTS 1024	//最大客户端链接数
@@ -48,7 +49,7 @@ int rclen = 0;
 char keyborad_buf[RCBUF_SIZE];
 int keyborad_len = 0;
 
-int status = STA_UNREADY;
+int status = STA_UNCONNECT;
 
 int recv_clear() {
 	ssize_t got = 0;
@@ -132,6 +133,8 @@ int main() {
 		return 1;
 	}
 
+	status = STA_CONNECT;
+
 	int flag = fcntl(client_fd, F_GETFL, 0);
 	fcntl(client_fd, F_SETFL, flag | O_NONBLOCK);
 
@@ -160,15 +163,22 @@ int main() {
 			int fd = events[i].data.fd;
 			if (fd == STDIN_FILENO) {
 				int n = read(STDIN_FILENO, keyborad_buf+keyborad_len, RCBUF_SIZE-keyborad_len);
-				n -= 1;		//去除\n
-				keyborad_len += n;
-				if (n < 0) {
+				if (n <= 0) {
 					perror("read");
 					return 1;
 				}
-				//未准备就绪，可发送的包为注册包，理论上来说应该先从wait状态开始，这个状态下不能发送任何东西，在收到服务器regis后才进入unready才能发送注册包，我这里把这一步省略了，直接允许发送regis包
+				keyborad_buf[strcspn(keyborad_buf, "\n")] = '\0';
+				keyborad_len = n - 1;
+
+				if (SDBUF_SIZE-5-keyborad_len<sdlen) {
+						printf("sdbuf full,drop pakcet\n");
+						keyborad_len = 0;
+						continue;
+				}
+				//未准备就绪，可发送的包为注册包
 				if (status == STA_UNREADY) {
-					uint32_t len = htonl(n);
+
+					uint32_t len = htonl(keyborad_len);
 					memcpy(sdbuf + sdlen, &len, sizeof(len));
 					sdlen += 4;
 
@@ -187,7 +197,7 @@ int main() {
 					}
 				}
 				else if (status == STA_READY) {
-					uint32_t len = htonl(n);
+					uint32_t len = htonl(keyborad_len);
 					memcpy(sdbuf + sdlen, &len, sizeof(len));
 					sdlen += 4;
 
@@ -196,7 +206,7 @@ int main() {
 					sdlen += 1;
 
 					memcpy(sdbuf + sdlen, keyborad_buf, keyborad_len);
-					sdlen += n;
+					sdlen += keyborad_len;
 					keyborad_len = 0;
 
 					int x = flush();
@@ -240,6 +250,7 @@ int main() {
 						rclen -= 1;
 						memmove(rcbuf, rcbuf + 1, rclen);
 						if (type == MSG_REGIS) {
+							status = STA_UNREADY;
 							printf("%.*s\n", len, rcbuf);
 						}
 						else if (type == MSG_RECOGISE) {
