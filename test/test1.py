@@ -29,7 +29,7 @@ def send_packet(sock,Type,buf):
 
 def main():
     sock=socket.socket()
-    f = sock.makefile("rb") 
+    f = sock.makefile("rb") #将sock封装成一个r可读的b二进制文件
     try:
         sock.connect((HOST,PORT))
 

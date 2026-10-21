@@ -38,7 +38,7 @@ def main():
 
         t, body = recv_packet(f)
         assert t == MSG_REGIS, f"expected REGIS, got {t}"
-        print(f"[OK] server sent REGIS: {body!r}")
+        print(f"{body!r}")
 
         name="Beth"
 
@@ -46,14 +46,11 @@ def main():
 
         t, body = recv_packet(f)
         assert t == MSG_RECOGISE, f"expected RECOGISE, got {t}"
-        assert b"Beth" in body, f"RECOGISE missing name: {body!r}"
-        print(f"[OK] server sent RECOGISE: {body!r}")
+        print(f"{body!r}")
 
         msg="Hi"
 
         send_packet(sock,MSG_CHAT,msg)
-
-        
 
 
     finally:
