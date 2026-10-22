@@ -1,3 +1,6 @@
+#半包测试
+#将数据包分header，type，body三部分各自单独发送
+#预计：服务器收到数据包后正常处理，结果会和没拆开来一样
 import socket
 import struct
 from time import sleep

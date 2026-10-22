@@ -447,6 +447,7 @@ int packet_dispatch(Conn* conn) {
 		return 1;
 	}
 	else if (type == MSG_CHAT) {
+		//若为未注册，则不可发送消息，且消息要被消费
 		if (conn->status != STA_READY) {//状态不符合消息管制，拒收丢弃
 			LOG(LOG_INFO, conn->fd, "Client:%.*s send a packet out of status ,current status:%d ,drop the packet", conn->name_len, conn->name, conn->status);
 			return 1;
@@ -454,10 +455,7 @@ int packet_dispatch(Conn* conn) {
 		//[len1][type][msg] --> [len2][type][name_len][name][msg]
 		//length数据包全长 body_len拼装后数据体长度 len原数据包数据体长度
 		
-		//若为未注册，则不可发送消息，且消息要被消费
-		if (conn->status != STA_READY) {
-			return 1;
-		}
+
 
 		//计算新数据体长度
 		uint32_t body_len = len + conn->name_len + sizeof(conn->name_len);

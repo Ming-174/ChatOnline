@@ -1,3 +1,6 @@
+#粘包半包混合测试
+#将三个数据包一起分两次发送，一次发送1.5个数据包
+#预计：服务器正常响应，运行正常
 import socket
 import struct
 from time import sleep
