@@ -70,6 +70,14 @@ int epfd;
 #define STA_UNREADY 1
 #define STA_READY 2
 
+//服务器计数器系列
+long long recv_packet_num = 0;	//收到的数据包数
+long long server_packet_num = 0;	//服务器创建的数据包数
+long long broadcast_packe_num = 0;		//广播的数据包数，目前仅仅统计被拷贝至sdbuf的数据包个数
+long long consum_packet_num = 0;	//消费的数据包数
+long long drop_packet_num = 0;		//丢包数，注意：丢包包括服务器创建的数据包和从客户端收到的数据包
+long long connection_num = 0;	//连接数
+
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
 	int fd;
