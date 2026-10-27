@@ -71,12 +71,13 @@ int epfd;
 #define STA_READY 2
 
 //服务器计数器系列
-long long recv_packet_num = 0;	//收到的数据包数
-long long server_packet_num = 0;	//服务器创建的数据包数
-long long broadcast_packe_num = 0;		//广播的数据包数，目前仅仅统计被拷贝至sdbuf的数据包个数
+long long recv_packet_num = 0;	//收到的数据包数,即handler拆解出一个数据包的个数
+long long server_packet_num = 0;	//服务器创建的数据包数,发送可能不成功，但确实拷贝进了sdbuf里
+long long broadcast_packet_num = 0;		//广播的数据包数，目前仅仅统计被拷贝至sdbuf的数据包个数
 long long consum_packet_num = 0;	//消费的数据包数
 long long drop_packet_num = 0;		//丢包数，注意：丢包包括服务器创建的数据包和从客户端收到的数据包
-long long connection_num = 0;	//连接数
+long long current_connection_num = 0;	//当前的连接数，是TCP确定的连接数，不是accept的连接数
+long long sum_connection_num = 0;	//总计连接数，也是TCP确定的连接数
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
@@ -165,6 +166,7 @@ void clean(Conn* conn) {
 	memcpy(conn->name, "unknown", 7);
 	conn->name_len = 7;
 	close(fd);
+	current_connection_num--;
 }
 //返回值为-1的情况代表错误和客户端关闭，这两种都需要进行处理，所以被归为一类
 //正常情况返回值为got
@@ -221,12 +223,13 @@ void msg_cpy(char*buf, int length, Conn* conn) {
 	//不可以说能塞多少塞多少，这会导致没塞下的包被丢失后，客户端协议永远没办法解析完整这个包，实际上导致解析错乱，把别的数据包的消息头拿去解析了
 	if (SDBUF_SIZE - conn->sdlen < length) {
 		LOG(LOG_WARN,conn->fd,"Client:%.*s space no enough,drop packet", conn->name_len, conn->name);
+		drop_packet_num++;
 		return;
 	}
-
-	//谨记不是每个数组都是空的，可能有旧数据存留
 	memcpy(conn->sdbuf + conn->sdlen, buf, length);
 	conn->sdlen += length;
+
+	broadcast_packet_num++;
 }
 
 //发送：三种结果，内核缓冲区满send终止，sdbuf完全发送，或者两种同时发生
@@ -354,6 +357,10 @@ void handler(Conn* conn) {
 		return;
 	}
 	while(conn->rclen >= 5) {		//头完整，再进入数据体判断
+
+		//计数器增加
+		recv_packet_num++;
+
 		uint32_t body_len;
 
 		//将rcbuf里取出头4个字节放进body_len
@@ -395,6 +402,7 @@ void handler(Conn* conn) {
 				//正常运行，消费数据包
 				conn->rclen -= 5 + body_len;
 				memmove(conn->rcbuf, conn->rcbuf + body_len + 5, conn->rclen);
+				consum_packet_num++;
 			}
 		}
 
@@ -540,6 +548,8 @@ int notice(Conn* conn, uint8_t type, const char* buf, int Len){
 	memcpy(p, buf, Len);
 	conn->sdlen += sizeof(len) + 1 + Len;
 
+	server_packet_num++;
+
 	//发送
 	int n = flush(conn);
 	if (n == -1)return -1;
@@ -563,12 +573,16 @@ void accept_client(Conn* conn) {
 			break;
 		}
 
+		current_connection_num++;
+		sum_connection_num++;
+
 		//创建新链接，初始化链接，并将新链接放入conns
 		Conn* new_conn = conn_insert(client_fd);
 		//如果连接的客户端满了，直接放弃剩下想要连接的客户端
 		if (new_conn == NULL) {
 			LOG(LOG_WARN, client_fd, "Connection is full,drop connection");
 			close(client_fd);
+			current_connection_num--;
 			break;
 		}
 
@@ -732,6 +746,14 @@ int main() {
 			}
 			else if (fail_list[i] == NULL)break;
 		}
+		printf("recv_packet_num=%lld\nserver_packet_num=%lld\nbroadcast_packet_num=%lld\nconsum_packet_num=%lld\ndrop_packet_num=%lld\ncurrent_connection_num=%lld\nsum_connection_num=%lld\n",
+			recv_packet_num,
+			server_packet_num,
+			broadcast_packet_num,
+			consum_packet_num,
+			drop_packet_num,
+			current_connection_num,
+			sum_connection_num);
 	}
 	//暂未设定如何关闭服务器
 	LOG(LOG_INFO, server_fd, "Server offline\n");

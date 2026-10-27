@@ -16,6 +16,29 @@
 
 int connect_number = 0;
 
+int epfd;
+int client_fd;
+
+#define STA_CLOSE -1
+#define STA_CONNECT 0
+#define STA_UNCONNECT 1
+#define STA_UNREADY 2
+#define STA_READY 3
+
+#define MAX_EVENTS 128	//最大同时处理响应链接数
+#define MAX_CLIENTS 1024	//最大客户端链接数
+#define MAX_PACKET 1024		//单个数据包最大大小
+#define RCBUF_SIZE (2 * MAX_PACKET + 4 )	//接收缓冲区长度
+#define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
+#define MAX_NAME 32		//最长名字
+
+#define MSG_REGIS 0
+#define MSG_LOGIN 1
+#define MSG_LOGOUT 2
+#define MSG_CHAT 3
+#define MSG_NOTICE 4
+#define MSG_RECOGISE 5
+
 typedef struct Conn {
 	int fd;
 	//接收缓冲区
@@ -46,29 +69,6 @@ Conn* conn_insert(int fd) {
 	}
 	return NULL;
 }
-
-int epfd;
-int client_fd;
-
-#define STA_CLOSE -1
-#define STA_CONNECT 0
-#define STA_UNCONNECT 1
-#define STA_UNREADY 2
-#define STA_READY 3
-
-#define MAX_EVENTS 128	//最大同时处理响应链接数
-#define MAX_CLIENTS 1024	//最大客户端链接数
-#define MAX_PACKET 1024		//单个数据包最大大小
-#define RCBUF_SIZE (2 * MAX_PACKET + 4 )	//接收缓冲区长度
-#define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
-#define MAX_NAME 32		//最长名字
-
-#define MSG_REGIS 0
-#define MSG_LOGIN 1
-#define MSG_LOGOUT 2
-#define MSG_CHAT 3
-#define MSG_NOTICE 4
-#define MSG_RECOGISE 5
 
 
 uint64_t current_us() {
@@ -185,7 +185,6 @@ int send_clear(Conn* conn) {
 int flush(Conn* conn) {
 	//返回-1代表这个链接已经关闭，不可再用，上级程序应该采取其他操作
 	if (conn->fd == -1)return -1;
-	if (conn->status == STA_ERROR || conn->status == STA_DISCONNECT)return -1;
 	int sd = send_clear(conn);
 	if (sd < 0) {
 		perror("send");
@@ -260,7 +259,7 @@ int main(int argc,char*argv[]) {
 
 	epfd = epoll_create(1);
 
-	int client_number = atoi(arvg[2]);
+	int client_number = atoi(argv[1]);
 
 	//创建指定数目的连接
 	for (int i = 0; i < client_number; i++) {
@@ -343,7 +342,7 @@ int main(int argc,char*argv[]) {
 
 					if (type == MSG_REGIS) {
 						conn->status = STA_UNREADY;
-						//printf("%.*s\n", len, conn->rcbuf);
+						printf("%.*s\n", len, conn->rcbuf);
 						//自动登录
 						char* name = "Beth";
 						char finalname[900];
@@ -352,29 +351,34 @@ int main(int argc,char*argv[]) {
 					}
 					else if (type == MSG_RECOGISE) {
 						conn->status = STA_READY;
-						//printf("%.*s\n", len, conn->rcbuf);
+						printf("%.*s\n", len, conn->rcbuf);
 						connect_number++;
 
 					}
 					else if (type == MSG_NOTICE) {
-						//printf("%.*s\n", conn->len, conn->rcbuf);
+						printf("%.*s\n", conn->rclen, conn->rcbuf);
 					}
 					else if (type == MSG_CHAT) {
-						uint32_t name_len;
-						memcpy(&name_len, rcbuf, 4);
+						/*uint32_t name_len;
+						memcpy(&name_len, conn->rcbuf, 4);
 						name_len = ntohl(name_len);
 
 						char result[900];
 
 						uint64_t time;
-						memcpy(&time, rcbuf + len - 8, 8);
+						memcpy(&time, conn->rcbuf + len - 8, 8);
 						time = be64toh(time);
 						uint64_t curr_time = current_us();
 						uint64_t distant_time = curr_time - time;
 
-						int len = snprintf(result, sizeof(result), "%.*s:%d\n", name_len, rcbuf + 4, (int)distant_time);
+						int lenght = snprintf(result, sizeof(result), "%.*s:%d\n", name_len,conn->rcbuf + 4, (int)distant_time);
 
-						write(result_fd, result, len);
+						write(result_fd, result, lenght);
+						*/
+						uint32_t name_len;
+						memcpy(&name_len, conn->rcbuf, 4);
+						name_len = ntohl(name_len);
+						printf("%.*s:%.*s\n", name_len, conn -> rcbuf + 4, len - 4 - name_len, conn->rcbuf + 4 + name_len);
 					}
 					//消费消息
 					conn->rclen -= len;
@@ -382,7 +386,7 @@ int main(int argc,char*argv[]) {
 				}
 			}
 			if (events[i].events & EPOLLOUT) {
-				int x = flush();
+				int x = flush(conn);
 				if (x < 0) {
 					printf("Server disconnect\n");
 					return 0;
@@ -392,7 +396,7 @@ int main(int argc,char*argv[]) {
 
 
 		
-		/*if (connect_number==atoi(arvg[1])) {
+		/*if (connect_number==atoi(argv[1])) {
 			sleep(20);
 			char buf[] = "Hi!I'm Beth,Beth love you";
 			if (SDBUF_SIZE - sdlen < strlen(buf) + 5) {
