@@ -38,6 +38,7 @@ int client_fd;
 #define MSG_CHAT 3
 #define MSG_NOTICE 4
 #define MSG_RECOGISE 5
+#define MSG_TEST 6
 
 typedef struct Conn {
 	int fd;
@@ -353,6 +354,10 @@ int main(int argc,char*argv[]) {
 						conn->status = STA_READY;
 						printf("%.*s\n", len, conn->rcbuf);
 						connect_number++;
+						
+						//申请注册成为测试机，不接收广播
+						char* buf = "1";
+						notice(conn, MSG_TEST, buf, 1);
 
 					}
 					else if (type == MSG_NOTICE) {

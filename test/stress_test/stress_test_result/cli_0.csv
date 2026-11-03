@@ -1,0 +1,2 @@
+client_name,latency_sum,max_latency,nmin_latency,receive chat packet,create packet,drop packet
+3141,461,154,10,10,0

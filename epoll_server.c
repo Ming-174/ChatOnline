@@ -18,7 +18,7 @@
 [数据头][数据类型][数据体]
 
 [数据头]数据头Header，uint32_t的4字节32位二进制，用来表示数据体的长度，所以又称“数据体长度”
-[数据类型]数据类型Type，uint_t的1字节8位二进制，用来表示数据体的类型
+[数据类型]数据类型Type，uint8_t的1字节8位二进制，用来表示数据体的类型
 [数据体]数据体是有效数据，他根据不同的type有不同的结构，需要做不同的操作
 
 简单来说数据头是讲数据体有多长的，数据类型是讲数据是哪一类的、用来干什么的，数据体就是要被拿来使用的数据本身
@@ -56,19 +56,21 @@
 #define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
 #define MAX_NAME 32		//最长名字
 
-#define MSG_REGIS 0
-#define MSG_LOGIN 1
-#define MSG_LOGOUT 2
-#define MSG_CHAT 3
-#define MSG_NOTICE 4
-#define MSG_RECOGISE 5
+#define MSG_REGIS 0		//注册消息
+#define MSG_LOGIN 1		//登录消息
+#define MSG_LOGOUT 2	//登出消息
+#define MSG_CHAT 3		//聊天消息
+#define MSG_NOTICE 4	//服务器提示
+#define MSG_RECOGISE 5		//登录认可消息
+#define MSG_TEST 6		//转变测试机申请
 
 int epfd;
 
-#define STA_ERROR -1
-#define STA_DISCONNECT 0
-#define STA_UNREADY 1
-#define STA_READY 2
+#define STA_ERROR -1	//已经发生致命错误的连接，错误有系统级错误和业务违规两种
+#define STA_DISCONNECT 0	//该连接为空连接
+#define STA_UNREADY 1	//未完成注册，不可直接使用
+#define STA_READY 2		//已完成注册，可以正常使用
+#define STA_TEST 3		//测试发报机，不对其进行广播
 
 //服务器计数器系列
 long long recv_packet_num = 0;	//收到的数据包数,即handler拆解出一个数据包的个数
@@ -78,6 +80,10 @@ long long consum_packet_num = 0;	//消费的数据包数
 long long drop_packet_num = 0;		//丢包数，注意：丢包包括服务器创建的数据包和从客户端收到的数据包
 long long current_connection_num = 0;	//当前的连接数，是TCP确定的连接数，不是accept的连接数
 long long sum_connection_num = 0;	//总计连接数，也是TCP确定的连接数
+long long error_disconnect_num = 0;		//致命错误导致断开的连接数目，包括TCP错误，系统调用错误，业务违规
+long long normal_disconnect_num = 0;	//正常断开的连接数目
+long long syscall_error_num = 0;		//系统调用错误数，主要是包含了TCP系统调用错误，服务器也可能有自身的错误，还有什么我就不清楚了
+long long close_accept_num = 0;		//服务器在accept后立即close的连接数，是在conns名单满员的情况下拒绝的
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
@@ -157,6 +163,10 @@ void clean(Conn* conn) {
 	}
 	//先除名，再关闭，防止fd被复用但又被除名
 	LOG(LOG_INFO, conn->fd, "Client:%.*s disconnect,status %d -> STA_DISCONNECT", conn->name_len, conn->name,conn->status);
+
+	if (conn->status == STA_ERROR)error_disconnect_num++;
+	else normal_disconnect_num++;
+
 	epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
 	int fd = conn->fd;
 	conn->fd = -1;
@@ -513,6 +523,12 @@ int packet_dispatch(Conn* conn) {
 
 		return 1;
 	}
+	else if (type == MSG_TEST) {
+		if (conn->status != STA_READY)return -1;//如果申请成功，就成测试机，不成功就还是普通客户端
+		LOG(LOG_INFO, conn->fd, "Client:%.*s switch to test_client,no longer receive broadcast,status %d -> STA_TEST", conn->name_len, conn->name, conn->status);
+		conn->status = STA_TEST;
+		return 1;
+	}
 	//不明类型数据包，直接挂断链接
 	else {
 		char* buf = "Your packet is unclear";
@@ -556,6 +572,9 @@ int notice(Conn* conn, uint8_t type, const char* buf, int Len){
 	return 1;
 }
 
+//批量accept连接
+//原理与与非阻塞IO相同，反复执行accept，直达EAGAIN||EWOULDBLOCK
+//每次就先accept一个连接，判断当前conns名单是否已满，如果满了就挂断，没满就accept
 void accept_client(Conn* conn) {
 	while (1) {
 		int client_fd = accept(conn->fd, NULL, NULL);
@@ -582,6 +601,7 @@ void accept_client(Conn* conn) {
 		if (new_conn == NULL) {
 			LOG(LOG_WARN, client_fd, "Connection is full,drop connection");
 			close(client_fd);
+			close_accept_num++;
 			current_connection_num--;
 			break;
 		}
@@ -746,14 +766,18 @@ int main() {
 			}
 			else if (fail_list[i] == NULL)break;
 		}
-		printf("recv_packet_num=%lld\nserver_packet_num=%lld\nbroadcast_packet_num=%lld\nconsum_packet_num=%lld\ndrop_packet_num=%lld\ncurrent_connection_num=%lld\nsum_connection_num=%lld\n",
+		printf("recv_packet_num=%lld\nserver_packet_num=%lld\nbroadcast_packet_num=%lld\nconsum_packet_num=%lld\ndrop_packet_num=%lld\ncurrent_connection_num=%lld\nsum_connection_num=%lld\nnormal_disconnect_num=%lld\nerror_disconnect_num=%lld\nclose_accept_num=%lld\n",
 			recv_packet_num,
 			server_packet_num,
 			broadcast_packet_num,
 			consum_packet_num,
 			drop_packet_num,
 			current_connection_num,
-			sum_connection_num);
+			sum_connection_num,
+			normal_disconnect_num,
+			error_disconnect_num,
+			close_accept_num
+		);
 	}
 	//暂未设定如何关闭服务器
 	LOG(LOG_INFO, server_fd, "Server offline\n");
@@ -773,8 +797,6 @@ int main() {
 // 安排压力测试
  
 // 优化sdbuf成双指针
- 
-// 增加日志
 
 //思考
 //我要怎样对齐服务器与客户端的协议

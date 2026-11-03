@@ -14,6 +14,8 @@
 int epfd;
 int client_fd;
 
+int turn = 0;
+
 #define STA_CLOSE -1
 #define STA_CONNECT 0
 #define STA_UNCONNECT 1
@@ -123,9 +125,11 @@ int flush() {
 
 int main() {
 	client_fd = socket(AF_INET, SOCK_STREAM, 0);
+	printf("fd:%d\n", client_fd);
 	struct sockaddr_in addr;
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(8888);
+	//inet_pton(AF_INET, "10.225.12.240", &addr.sin_addr);
 	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
 	if (connect(client_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
