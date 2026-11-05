@@ -23,10 +23,16 @@ long long latency_sum = 0;
 int max_latency = 0;
 int min_latency = 99999999;
 long long chat_packet_num = 0;
-long long create_packet_num = 0;
-long long drop_packet_num = 0;
+long long create_chat_packet_num = 0;
+long long drop_chat_packet_num = 0;
+int latency_buckets[100000] = { 0 };
+int latency_over_1s=0;
+uint64_t sending_time = 0;
+uint64_t main_running_time = 0;
+
 
 static atomic_bool stop = false;
+static atomic_bool main_stop = false;
 
 int epfd;
 int client_fd;
@@ -253,6 +259,9 @@ int notice(Conn* conn, uint8_t type, const char* buf, int Len) {
 }
 
 void* worker(void* arg) {
+
+	uint64_t send_star_time = current_us();
+
 	int fd = (int)(intptr_t)arg;
 
 	char sdbuf[SDBUF_SIZE];
@@ -283,11 +292,11 @@ void* worker(void* arg) {
 
 		if (sdlen > SDBUF_SIZE - buflen) {
 			printf("Unable to copy : sdbuf space no enough\n");
-			drop_packet_num++;
+			drop_chat_packet_num++;
 			continue;
 		}
 
-		create_packet_num++;
+		create_chat_packet_num++;
 
 		memcpy(sdbuf + sdlen, buf, buflen);
 		sdlen += buflen;
@@ -297,7 +306,7 @@ void* worker(void* arg) {
 
 		buflen -= 8;
 	}
-
+	sending_time = current_us() - send_star_time;
 }
 
 void* thread_signal(void* arg) {
@@ -307,6 +316,8 @@ void* thread_signal(void* arg) {
 	int sig;
 	sigwait(&set, &sig);
 	atomic_store(&stop, true);
+	sleep(10);
+	atomic_store(&main_stop, true);
 	return NULL;
 }
 
@@ -324,6 +335,8 @@ int main(int argc, char* argv[]) {
 	//创建线程
 	pthread_t sig_pid;
 	pthread_create(&sig_pid, NULL, thread_signal, NULL);
+
+	uint64_t main_star_time = current_us();
 
 
 	//fd=-1来表示conns的空位，status为生命和业务状态
@@ -374,7 +387,7 @@ int main(int argc, char* argv[]) {
 	int turn = 0;
 	pthread_t pid;
 
-	while (atomic_load(&stop)==false) {
+	while (atomic_load(&main_stop)==false) {
 		int n = epoll_wait(epfd, events, 1, 100);
 		if (n < 0) {
 			if (errno == EINTR)continue;
@@ -451,6 +464,12 @@ int main(int argc, char* argv[]) {
 						latency_sum += distant_time;
 						if (distant_time > max_latency)max_latency = distant_time;
 						if (distant_time < min_latency)min_latency = distant_time;
+						if (distant_time >= 1000000) {
+							latency_over_1s++;
+						}
+						else {
+							latency_buckets[distant_time / 10]++;
+						}
 						chat_packet_num++;
 						/*
 						uint32_t name_len;
@@ -481,29 +500,51 @@ int main(int argc, char* argv[]) {
 	pthread_join(sig_pid, NULL);
 	pthread_join(pid, NULL);
 	
-
-	//printf("latency_sum:%lld\nmax_latency:%d\nmin_latency:%d\nreceive chat packet:%lld\ncreate packet:%lld\ndrop packet:%lld\n",
-	//	latency_sum,
-	//	max_latency,
-	//	min_latency,
-	//	chat_packet_num,
-	//	create_packet_num,
-	//	drop_packet_num
-	//);
+	main_running_time = current_us() - main_star_time;
 
 	char path[99999];
 	snprintf(path, sizeof(path), "./%s/%s.csv","stress_test_result", argv[1]);
 	int result_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
-	char* header = "client_name,latency_sum,max_latency,min_latency,receive_chat_packet,create_packet,drop_packet";
+	char* header = "latency_buckets,latency_count,latency_over_1s,latency_sum,max_latency,min_latency,receive_chat_packet,create_chat_packet,drop_packet,main_running_time,sending_time";
 	char result_date[99999];
-	snprintf(result_date, sizeof(result_date), "%s\n%lld,%d,%d,%lld,%lld,%lld", header,
+	//找到第一个有效数据
+	int first_data = 0;
+	for (int i = 0; i < 100000; i++) {
+		if (latency_buckets[i] != 0) {
+			first_data = i;
+			break;
+		}
+	}
+	snprintf(result_date, sizeof(result_date), "%s\n%d,%d,%d,%lld,%d,%d,%lld,%lld,%lld,%lu,%lu\n", header,
+		first_data,
+		latency_buckets[first_data],
+		latency_over_1s,
 		latency_sum,
 		max_latency,
 		min_latency,
 		chat_packet_num,
-		create_packet_num,
-		drop_packet_num);
+		create_chat_packet_num,
+		drop_chat_packet_num,
+		main_running_time,
+		sending_time
+	);
 	write(result_fd, result_date, strlen(result_date));
+	
+	char tmp[9999];
+	int tmp_idx = 0;
+	for (int i = first_data + 1; i < 100000; i++) {
+		if (latency_buckets[i] == 0)continue;
+		int write_len = snprintf(tmp + tmp_idx, sizeof(tmp) - tmp_idx, "%d,%d,,,,,,,\n", i, latency_buckets[i]);
+		tmp_idx += write_len;
+		if (tmp_idx > 9900) {
+			write(result_fd, tmp, tmp_idx);
+			tmp_idx = 0;
+		}
+	}
+	if (tmp_idx != 0) {
+		write(result_fd, tmp, tmp_idx);
+	}
+	close(client_fd);
 	close(result_fd);
 }

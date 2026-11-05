@@ -1,2 +1,11 @@
-client_name,latency_sum,max_latency,nmin_latency,receive chat packet,create packet,drop packet
-4869,1870,139,10,10,0
+latency_buckets,latency_count,latency_over_1s,latency_sum,max_latency,min_latency,receive_chat_packet,create_chat_packet,drop_packet,main_running_time,sending_time
+18,1,0,4308,720,180,10,10,0,20039317,10003594
+22,1,,,,,,,
+31,1,,,,,,,
+32,1,,,,,,,
+37,1,,,,,,,
+39,1,,,,,,,
+50,1,,,,,,,
+57,1,,,,,,,
+68,1,,,,,,,
+72,1,,,,,,,
