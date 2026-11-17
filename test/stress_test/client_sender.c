@@ -14,6 +14,7 @@
 #include<pthread.h>
 #include<signal.h>
 #include<stdatomic.h>
+#include<netinet/tcp.h>
 
 #define MAX_PACKET 1024
 
@@ -95,6 +96,12 @@ uint64_t current_us() {
 	return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
+//关闭该从本机到对端的TCP Nagle算法
+void set_nodelay(int fd) {
+	int one = 1;
+	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0)
+		perror("setsockopt TCP_NODELAY");
+}
 
 //返回值为-1的情况代表错误和客户端关闭，这两种都需要进行处理，所以被归为一类
 //正常情况返回值为got
@@ -144,7 +151,7 @@ void msg_cpy(char* buf, int length, Conn* conn) {
 	//如果连接的用户态缓冲区不足，就直接放弃这个包,执行静默丢包
 	//不可以说能塞多少塞多少，这会导致没塞下的包被丢失后，客户端协议永远没办法解析完整这个包，实际上导致解析错乱，把别的数据包的消息头拿去解析了
 	if (SDBUF_SIZE - conn->sdlen < length) {
-		printf("Client:%d space no enough,drop packet", conn->fd);
+		//printf("Client:%d space no enough,drop packet", conn->fd);
 		return;
 	}
 
@@ -232,7 +239,7 @@ int flush(Conn* conn) {
 int notice(Conn* conn, uint8_t type, const char* buf, int Len) {
 	//检查
 	if (Len > SDBUF_SIZE - conn->sdlen - 5) {
-		printf("Unable to notice: conn's send space no enough");
+		//printf("Unable to notice: conn's send space no enough");
 		return 1;//这里的1不代表完成任务，只代表运行正常，但确实是无法达到结果
 	}
 
@@ -291,8 +298,9 @@ void* worker(void* arg) {
 		buflen += 8;
 
 		if (sdlen > SDBUF_SIZE - buflen) {
-			printf("Unable to copy : sdbuf space no enough\n");
+			//printf("Unable to copy : sdbuf space no enough\n");
 			drop_chat_packet_num++;
+			buflen -= 8;
 			continue;
 		}
 
@@ -302,8 +310,10 @@ void* worker(void* arg) {
 		sdlen += buflen;
 
 		int sd = send(fd, sdbuf, sdlen, MSG_NOSIGNAL);
-		sdlen -= sd;
-
+		if (sd > 0) {
+			sdlen -= sd;
+			memmove(sdbuf, sdbuf + sd, sdlen);
+		}
 		buflen -= 8;
 	}
 	sending_time = current_us() - send_star_time;
@@ -363,10 +373,12 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
+	set_nodelay(client_fd);
+
 	//放进大名单，每个连接有独自的数据管理
 	Conn* new_conn = conn_insert(client_fd);
 	if (new_conn == NULL) {
-		printf("Conns full");
+		//printf("Conns full");
 		return 0;
 	}
 
@@ -399,11 +411,11 @@ int main(int argc, char* argv[]) {
 			if (events[i].events & EPOLLIN) {
 				int x = recv_clear(conn);
 				if (x == -1) {
-					printf("error");
+					//printf("error");
 					return 0;
 				}
 				if (x == -2) {
-					printf("Server close");
+					//printf("Server close");
 					return 0;
 				}
 
@@ -431,7 +443,7 @@ int main(int argc, char* argv[]) {
 
 					if (type == MSG_REGIS) {
 						conn->status = STA_UNREADY;
-						printf("%.*s\n", len, conn->rcbuf);
+						//printf("%.*s\n", len, conn->rcbuf);
 						//自动登录
 						//char* name = "Beth";
 						char finalname[900];
@@ -440,12 +452,12 @@ int main(int argc, char* argv[]) {
 					}
 					else if (type == MSG_RECOGISE) {
 						conn->status = STA_READY;
-						printf("%.*s\n", len, conn->rcbuf);
+						//printf("%.*s\n", len, conn->rcbuf);
 						connect_number++;
 						turn = 1;
 					}
 					else if (type == MSG_NOTICE) {
-						printf("%.*s\n", conn->rclen, conn->rcbuf);
+						//printf("%.*s\n", conn->rclen, conn->rcbuf);
 					}
 					else if (type == MSG_CHAT) {
 						uint32_t name_len;
@@ -460,7 +472,7 @@ int main(int argc, char* argv[]) {
 						uint64_t curr_time = current_us();
 						uint64_t distant_time = curr_time - time;
 
-						printf("%.*s:%d\n", name_len, conn->rcbuf + 4, (int)distant_time);
+						//printf("%.*s:%d\n", name_len, conn->rcbuf + 4, (int)distant_time);
 						latency_sum += distant_time;
 						if (distant_time > max_latency)max_latency = distant_time;
 						if (distant_time < min_latency)min_latency = distant_time;
@@ -486,7 +498,7 @@ int main(int argc, char* argv[]) {
 			if (events[i].events & EPOLLOUT) {
 				int x = flush(conn);
 				if (x < 0) {
-					printf("Server disconnect\n");
+					//printf("Server disconnect\n");
 					return 0;
 				}
 			}

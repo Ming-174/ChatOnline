@@ -11,6 +11,10 @@
 #include<signal.h>
 #include<stdint.h>
 #include "log.h"
+#include<netinet/tcp.h>
+#include<time.h>
+#include<signal.h>
+#include<sys/signalfd.h>
 /*
 协议定义：
 
@@ -49,41 +53,56 @@
 		[文本消息]
 */
 
-#define MAX_EVENTS 128	//最大同时处理响应链接数
-#define MAX_CLIENTS 1024	//最大客户端链接数
-#define MAX_PACKET 1024		//单个数据包最大大小
+#define MAX_EVENTS 128						//最大同时处理响应链接数
+#define MAX_CLIENTS 1024					//最大客户端链接数
+#define MAX_PACKET 1024						//单个数据包最大大小
 #define RCBUF_SIZE (2 * MAX_PACKET + 4 )	//接收缓冲区长度
 #define SDBUF_SIZE (4 * MAX_PACKET + 4 )	//发送缓冲区长度
-#define MAX_NAME 32		//最长名字
+#define MAX_NAME 32							//最长名字
 
 #define MSG_REGIS 0		//注册消息
 #define MSG_LOGIN 1		//登录消息
 #define MSG_LOGOUT 2	//登出消息
 #define MSG_CHAT 3		//聊天消息
 #define MSG_NOTICE 4	//服务器提示
-#define MSG_RECOGISE 5		//登录认可消息
+#define MSG_RECOGISE 5	//登录认可消息
 #define MSG_TEST 6		//转变测试机申请
 
 int epfd;
 
-#define STA_ERROR -1	//已经发生致命错误的连接，错误有系统级错误和业务违规两种
+#define STA_ERROR -1		//已经发生致命错误的连接，错误有系统级错误和业务违规两种
 #define STA_DISCONNECT 0	//该连接为空连接
-#define STA_UNREADY 1	//未完成注册，不可直接使用
-#define STA_READY 2		//已完成注册，可以正常使用
-#define STA_TEST 3		//测试发报机，不对其进行广播
+#define STA_UNREADY 1		//未完成注册，不可直接使用
+#define STA_READY 2			//已完成注册，可以正常使用
+#define STA_TEST 3			//测试发报机，不对其进行广播
 
 //服务器计数器系列
-long long recv_packet_num = 0;	//收到的数据包数,即handler拆解出一个数据包的个数
-long long server_packet_num = 0;	//服务器创建的数据包数,发送可能不成功，但确实拷贝进了sdbuf里
-long long broadcast_packet_num = 0;		//广播的数据包数，目前仅仅统计被拷贝至sdbuf的数据包个数
-long long consum_packet_num = 0;	//消费的数据包数
-long long drop_packet_num = 0;		//丢包数，注意：丢包包括服务器创建的数据包和从客户端收到的数据包
-long long current_connection_num = 0;	//当前的连接数，是TCP确定的连接数，不是accept的连接数
-long long sum_connection_num = 0;	//总计连接数，也是TCP确定的连接数
-long long error_disconnect_num = 0;		//致命错误导致断开的连接数目，包括TCP错误，系统调用错误，业务违规
-long long normal_disconnect_num = 0;	//正常断开的连接数目
-long long syscall_error_num = 0;		//系统调用错误数，主要是包含了TCP系统调用错误，服务器也可能有自身的错误，还有什么我就不清楚了
-long long close_accept_num = 0;		//服务器在accept后立即close的连接数，是在conns名单满员的情况下拒绝的
+double recv_packet_num = 0;			//收到的数据包数,即handler拆解出一个数据包的个数
+double server_packet_num = 0;		//服务器创建的数据包数,发送可能不成功，但确实拷贝进了sdbuf里
+double broadcast_packet_num = 0;		//广播产生的数据包数，目前仅仅统计被拷贝至sdbuf的数据包个数
+double broadcast_msg_cpy_num = 0;	//广播试图进行数据包拷贝的次数
+double broadcast_num = 0;			//调用广播的次数
+double consum_packet_num = 0;		//消费的数据包数
+double drop_packet_num = 0;			//丢包数，只记录进行广播时因缓冲区挤满放不下而drop的数据包，暂未记录丢弃服务器发送数据包的个数和拒绝非法包的个数
+double current_connection_num = 0;	//当前的连接数，是TCP确定的连接数，不是accept的连接数
+double sum_connection_num = 0;		//总计连接数，也是TCP确定的连接数
+double error_disconnect_num = 0;		//致命错误导致断开的连接数目，包括TCP错误，系统调用错误，业务违规
+double normal_disconnect_num = 0;	//正常断开的连接数目
+double close_accept_num = 0;			//服务器在accept后立即close的连接数，是在conns名单满员的情况下拒绝的
+double recv_chat_packet_num = 0;		//收到的chat数据包个数
+
+long double work_time = 0;					//开始收到第一个任意请求的时间至最后一个数据包处理完的用时
+long double first_pkt_recv_time = 0;
+long double last_pkt_consume_time = 0;
+long double epoll_wait_time = 0;			//epoll阻塞在epoll_wait上的时间
+long double accept_time = 0;				//进行accept并初始化连接并发送注册请求的总用时
+long double process_time = 0;				//处理一个收到的数据包用的时间,在收到任意数据包并放入分拣中心开始，到该数据包被完成使用，即将被消费
+long double chat_packet_process_time = 0;	//处理一个收到的chat数据包用的时间,在收到chat数据包并放入分拣中心开始，到该数据包被完成使用，即将被消费
+long double regis_packet_process_time = 0;	//处理一个收到的regis数据包用的时间,在收到regis数据包并放入分拣中心开始，到该数据包被完成使用，即将被消费
+long double broadcast_time = 0;			//进行全部广播的总时间
+long double broadcast_flush_time = 0;		//广播而进行flsuh的时间
+long double broadcast_msg_cpy_time = 0;	//广播而进行数据包拷贝的时间
+
 
 //结构体设计rclen和sdlen是显式设计，因为不太好给二进制数据包设定哨兵，这种做法能使得更安全，代码编写更方便
 typedef struct Conn {
@@ -117,6 +136,13 @@ Conn* fail_list[MAX_CLIENTS];
 int notice(Conn* conn, uint8_t type, const char* buf, int len);
 int packet_dispatch(Conn* conn);
 
+//微秒级时间戳
+uint64_t current_us() {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
 //非阻塞IO设置
 void set_nonblock(int fd) {
 	int flag = fcntl(fd, F_GETFL, 0);
@@ -139,6 +165,8 @@ Conn* conn_insert(int fd) {
 	return NULL;
 }
 
+
+
 //失效链接入队
 void report(Conn* conn) {
 	for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -152,6 +180,18 @@ void report(Conn* conn) {
 			LOG(LOG_DEBUG, conn->fd, "Client:%.*s has been push into fail_list", conn->name_len, conn->name);
 			break;
 		}
+	}
+}
+
+//关闭该从本机到对端的TCP Nagle算法
+void set_nodelay(Conn* conn) {
+	int fd = conn->fd;
+	int one = 1;
+	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+		perror("setsockopt TCP_NODELAY");
+		LOG(LOG_INFO, fd, "setsockopt TCP_NODELAY");
+		conn->status = STA_ERROR;
+		report(conn);
 	}
 }
 
@@ -323,12 +363,25 @@ int flush(Conn* conn) {
 //广播
 //遍历整个conns列表，如果不是空的，也不是消息发送者本人，就进行发送，用flush能更好的发送（使用send清理sdbuf，还可以进行状态注册）
 void broadcast(int fd,char*buf,int length){
+	uint64_t msg_cpy_begin = current_us();
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		//检查链接状态
 		if (conns[i].status == STA_READY) {
 			//检查槽位是否有链接
 			if (conns[i].fd != -1 && conns[i].fd != fd) {
 				msg_cpy(buf, length, &conns[i]);
+				broadcast_msg_cpy_num++;
+			}
+		}
+	}
+	broadcast_msg_cpy_time += current_us() - msg_cpy_begin;
+
+	uint64_t flush_begin = current_us();
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		//检查链接状态
+		if (conns[i].status == STA_READY) {
+			//检查槽位是否有链接
+			if (conns[i].fd != -1 && conns[i].fd != fd) {
 				int n = flush(&conns[i]);
 				if (n == -1) {
 					conns[i].status = STA_ERROR;
@@ -337,7 +390,9 @@ void broadcast(int fd,char*buf,int length){
 			}
 		}
 	}
-}
+	broadcast_flush_time += current_us() - flush_begin;
+
+}//这里其实有一个点可以优化，把msg_cpyg过的连接放入一个临时名单，后续的flush可以用这个名单直接检查sdlen，不用遍历
 
 //recv和send板块只负责尽可能从缓冲区拿出和放入数据，而拿出数据是不是一条数据包，发送的是不是一条数据包他们不处理
 
@@ -368,8 +423,7 @@ void handler(Conn* conn) {
 	}
 	while(conn->rclen >= 5) {		//头完整，再进入数据体判断
 
-		//计数器增加
-		recv_packet_num++;
+
 
 		uint32_t body_len;
 
@@ -398,7 +452,24 @@ void handler(Conn* conn) {
 
 		//判断数据体长度是否为数据头要求的长度
 		if (conn->rclen - 5 >= body_len) {
+
+			//计数器增加
+			recv_packet_num++;
+
+			uint8_t type;
+			memcpy(&type, conn->rcbuf + 4, 1);
+
+			uint64_t process_time_begin = current_us();
+
 			int X = packet_dispatch(conn);
+
+			last_pkt_consume_time = current_us();
+			process_time += current_us() - process_time_begin;
+			if (type == MSG_REGIS)regis_packet_process_time += current_us() - process_time_begin;
+			if (type == MSG_CHAT) { 
+				chat_packet_process_time += current_us() - process_time_begin;
+			}
+
 			//现将数据包执行结果分为两种，一种是正常运行，正常运行并不一定指数据包达到了他的目的，即使没办法达到目的也属于正常运行的结果，统一进入消费环节
 			//一种是致命失败，致命失败是需要直接进入清理程序的
 			if (X == -1) {
@@ -414,6 +485,8 @@ void handler(Conn* conn) {
 				memmove(conn->rcbuf, conn->rcbuf + body_len + 5, conn->rclen);
 				consum_packet_num++;
 			}
+
+
 		}
 
 		//不完整数据包
@@ -473,6 +546,7 @@ int packet_dispatch(Conn* conn) {
 		return 1;
 	}
 	else if (type == MSG_CHAT) {
+		recv_chat_packet_num++;
 		//若为未注册，则不可发送消息，且消息要被消费
 		if (conn->status != STA_READY) {//状态不符合消息管制，拒收丢弃
 			LOG(LOG_INFO, conn->fd, "Client:%.*s send a packet out of status ,current status:%d ,drop the packet", conn->name_len, conn->name, conn->status);
@@ -519,7 +593,11 @@ int packet_dispatch(Conn* conn) {
 		p += len;
 
 		LOG(LOG_DEBUG,conn->fd,"%.*s:%.*s", conn->name_len, buf + 9, ntohl(body_len) - 4 - conn->name_len, buf + 4 + 1 + 4 + conn->name_len);
+		
+		uint64_t broadcast_time_begin = current_us();
 		broadcast(conn->fd, buf, length);
+		broadcast_time += current_us() - broadcast_time_begin;
+		broadcast_num++;
 
 		return 1;
 	}
@@ -626,7 +704,24 @@ void accept_client(Conn* conn) {
 			new_conn->status = -1;
 			report(new_conn);
 		}
+
+		set_nodelay(new_conn);
 	}
+}
+
+int signalfd_create() {
+	//创建信号集
+	sigset_t sig;
+	sigemptyset(&sig);
+	sigaddset(&sig, SIGINT);
+
+	//阻塞SIGINT
+	sigprocmask(SIG_BLOCK, &sig, NULL);
+
+	//创建signalfd
+	int sigfd = signalfd(-1, &sig, SFD_NONBLOCK | SFD_CLOEXEC);
+
+	return sigfd;
 }
 
 int main() {
@@ -705,8 +800,33 @@ int main() {
  
 	LOG(LOG_INFO, server_fd, "Server Online");
 
+	//创建signalfd
+	int sigfd = signalfd_create();
+	//创建对应conn连接
+	Conn signalfd_conn;
+	signalfd_conn.fd = sigfd;
+	//放入epoll实例
+	struct epoll_event signalfd_ev;
+	signalfd_ev.data.ptr = &signalfd_conn;
+	signalfd_ev.events = EPOLLIN;
+	epoll_ctl(epfd, EPOLL_CTL_ADD, sigfd, &signalfd_ev);
+
+	bool is_start = false;
+	uint64_t epoll_wait_time_begin;
 	while (1) {
+
+		if (is_start == true)epoll_wait_time_begin = current_us();
+
 		int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+
+		if (is_start == true )epoll_wait_time += current_us() - epoll_wait_time_begin;
+
+		//检查是否为第一次收到请求，如果是，则开始计时
+		if (is_start == false) {
+			first_pkt_recv_time = current_us();
+			is_start = true;
+		}
+
 		if (n < 0) {
 			if (errno == EINTR)continue;
 			perror("epoll_wait");
@@ -715,9 +835,91 @@ int main() {
 		}
 		for (int i = 0; i < n; i++) {
 			Conn* conn = events[i].data.ptr;
+			
+
+
 			//新连接请求
 			if (conn == &server_conn) {
+				uint64_t accept_time_begin = current_us();
 				accept_client(conn);
+				accept_time += current_us() - accept_time_begin;
+			}
+			//是否为信号fd，如果是，则进入终结模式
+			else if (conn == &signalfd_conn) {
+				//从最后一个包，至得到终结信号的这段时间不要
+				epoll_wait_time -= current_us() - last_pkt_consume_time;
+				/*服务器计数器系列
+				double recv_packet_num = 0;			//收到的数据包数,即handler拆解出一个数据包的个数
+				double server_packet_num = 0;		//服务器创建的数据包数,发送可能不成功，但确实拷贝进了sdbuf里
+				double broadcast_packet_num = 0;		//广播产生的数据包数，目前仅仅统计被拷贝至sdbuf的数据包个数
+				double broadcast_msg_cpy_num = 0;	//广播试图进行数据包拷贝的次数
+				double broadcast_num = 0;			//调用广播的次数
+				double consum_packet_num = 0;		//消费的数据包数
+				double drop_packet_num = 0;			//丢包数，只记录进行广播时因缓冲区挤满放不下而drop的数据包，暂未记录丢弃服务器发送数据包的个数和拒绝非法包的个数
+				double sum_connection_num = 0;		//总计连接数，也是TCP确定的连接数
+				double error_disconnect_num = 0;		//致命错误导致断开的连接数目，包括TCP错误，系统调用错误，业务违规
+				double normal_disconnect_num = 0;	//正常断开的连接数目
+				double close_accept_num = 0;			//服务器在accept后立即close的连接数，是在conns名单满员的情况下拒绝的
+				double recv_chat_packet_num = 0;		//收到的chat数据包个数
+
+				 long double work_time = 0;					//开始收到第一个任意请求的时间至最后一个数据包处理完的用时
+				 long double first_pkt_recv_time = 0;
+				 long double last_pkt_consume_time = 0;
+				 long double epoll_wait_time = 0;			//epoll阻塞在epoll_wait上的时间
+				 long double accept_time = 0;				//进行accept并初始化连接并发送注册请求的总用时
+				 long double process_time = 0;				//处理一个收到的数据包用的时间,在收到任意数据包并放入分拣中心开始，到该数据包被完成使用，即将被消费
+				 long double chat_packet_process_time = 0;	//处理一个收到的chat数据包用的时间,在收到chat数据包并放入分拣中心开始，到该数据包被完成使用，即将被消费
+				 long double regis_packet_process_time = 0;	//处理一个收到的regis数据包用的时间,在收到regis数据包并放入分拣中心开始，到该数据包被完成使用，即将被消费
+				 long double broadcast_time = 0;			//进行全部广播的总时间
+				 long double broadcast_flush_time = 0;		//广播而进行flsuh的时间
+				 long double broadcast_msg_cpy_time = 0;	//广播而进行数据包拷贝的时间
+				*/
+				work_time = last_pkt_consume_time - first_pkt_recv_time;
+				//work_time主要包括四个部分，epollwait等待的时间，进行新连接accept的时间，接收数据包的时间，处理数据包的时间，小的部分包括epoll分发的时间和消费数据包的时间
+				printf("总工作时间us(收到第一个请求开始)：%Lf\nepoll等待时间占比：%Lf\n建立连接时间占比：%Lf\n处理数据包时间占比：%Lf\n",
+					work_time,
+					epoll_wait_time / work_time,
+					accept_time / work_time,
+					process_time / work_time
+				);
+				printf("=============================\n");
+				printf("处理数据包时间中的各项时间占比：\n登录请求数据包处理时间：%Lf\n聊天数据包处理占比：%Lf\n",
+					regis_packet_process_time / process_time,
+					chat_packet_process_time / process_time
+				);
+				printf("=============================\n");
+				printf("在处理聊天数据包中，进行广播的时间占比：%Lf\n在广播中进行拷贝占比：%Lf\n在广播中刷新缓冲区时间占比：%Lf\n聊天数据包平均处理时间：%Lf\n",
+					broadcast_time / chat_packet_process_time,
+					broadcast_msg_cpy_time / broadcast_time,
+					broadcast_flush_time / broadcast_time,
+					chat_packet_process_time / (long double)recv_chat_packet_num
+				);
+				printf("=============================\n");
+				printf("在%f次广播中，产生了%f个数据包\n因缓冲区积满而无法拷贝数据包的个数：%f\n广播包成功率%f，丢包率%f\n",
+					broadcast_num,
+					broadcast_packet_num,
+					drop_packet_num,
+					broadcast_packet_num / broadcast_msg_cpy_num,
+					drop_packet_num / broadcast_msg_cpy_num
+				);
+				printf("=============================\n"); 
+				printf("共收到%f个数据包，其中chat数据包个数为：%f，占比：%f\n",
+					recv_packet_num,
+					recv_chat_packet_num,
+					recv_chat_packet_num / recv_packet_num
+				);
+				printf("=============================\n");
+				printf("总计有%f个连接\n正常断开的连接数：%f，占比：%f\n致命错误导致断开的连接数：%f，占比：%f\n服务器连接积满而拒绝的连接数为：%f，占比：%f\n",
+					sum_connection_num,
+					normal_disconnect_num, normal_disconnect_num / sum_connection_num,
+					error_disconnect_num, error_disconnect_num / sum_connection_num,
+					close_accept_num, close_accept_num / sum_connection_num
+				);
+				printf("当前默认服务器执行终结程序时，全部客户端都已断开连接\n");
+				
+				LOG(LOG_INFO, server_fd, "Server offline\n");
+				close(server_fd);
+				return 0;
 			}
 			//已连接客户端请求
 			else {
@@ -757,6 +959,7 @@ int main() {
 					report(conn);
 				}
 			}
+
 		}
 		//事件响应轮结束，故障链接统一清理
 		for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -766,18 +969,18 @@ int main() {
 			}
 			else if (fail_list[i] == NULL)break;
 		}
-		printf("recv_packet_num=%lld\nserver_packet_num=%lld\nbroadcast_packet_num=%lld\nconsum_packet_num=%lld\ndrop_packet_num=%lld\ncurrent_connection_num=%lld\nsum_connection_num=%lld\nnormal_disconnect_num=%lld\nerror_disconnect_num=%lld\nclose_accept_num=%lld\n",
-			recv_packet_num,
-			server_packet_num,
-			broadcast_packet_num,
-			consum_packet_num,
-			drop_packet_num,
-			current_connection_num,
-			sum_connection_num,
-			normal_disconnect_num,
-			error_disconnect_num,
-			close_accept_num
-		);
+		//printf("recv_packet_num=%lld\nserver_packet_num=%lld\nbroadcast_packet_num=%lld\nconsum_packet_num=%lld\ndrop_packet_num=%lld\ncurrent_connection_num=%lld\nsum_connection_num=%lld\nnormal_disconnect_num=%lld\nerror_disconnect_num=%lld\nclose_accept_num=%lld\n",
+		//	recv_packet_num,
+		//	server_packet_num,
+		//	broadcast_packet_num,
+		//	consum_packet_num,
+		//	drop_packet_num,
+		//	current_connection_num,
+		//	sum_connection_num,
+		//	normal_disconnect_num,
+		//	error_disconnect_num,
+		//	close_accept_num
+		//);
 	}
 	//暂未设定如何关闭服务器
 	LOG(LOG_INFO, server_fd, "Server offline\n");

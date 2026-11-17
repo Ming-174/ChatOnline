@@ -1,7 +1,7 @@
 #!/bin/bash
 
-CLIENTS=2
-RUNNING_TIME=10
+CLIENTS=250
+RUNNING_TIME=60
 
 pids=()
 
